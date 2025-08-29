@@ -1,0 +1,6 @@
+*.*/
+main/mr-tmp/
+mrtmp.*
+824-mrinput-*.txt
+/mapreduce/src/x.txt
+*.so
