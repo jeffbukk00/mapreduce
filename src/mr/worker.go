@@ -12,17 +12,17 @@ import (
 // ------------------------
 // Private constants
 // ------------------------
-type connectionState int
+type connectionStatus int
 
 const (
-	Unconnected connectionState = iota
+	Unconnected connectionStatus = iota
 	Connected
 )
 
-type jobProgressionState int
+type jobProgressionStatus int
 
 const (
-	Unscheduled jobProgressionState = iota
+	Unscheduled jobProgressionStatus = iota
 	Scheduled
 	InputFetched
 	TaskProcessed
@@ -49,45 +49,84 @@ type reduceFunc func(string, []string) string
 // Job-related type definitions
 // ------------------------
 type job struct {
-	class            TaskClass
-	seq              int
-	progressionState jobProgressionState
-	inputPath        []string
-	requiredInputs   int
+	class             TaskClass
+	seq               int
+	progressionStatus jobProgressionStatus
+	inputPath         []string
+	requiredInputs    int
 }
 
 // ------------------------
 // Worker-related type definitions
 // ------------------------
 type workerProfile struct {
-	id              int
-	connectionState connectionState
+	id int
 }
 
-type workerContext struct {
-	profile workerProfile
-	mapf    mapFunc
-	reducef reduceFunc
+type workerState struct {
+	profile          workerProfile
+	connectionStatus connectionStatus
+	currentJob       job
+	mapf             mapFunc
+	reducef          reduceFunc
 }
 
 type Worker struct {
-	context    workerContext
-	currentJob job
-	rpcClient  *WorkerRPC
+	state workerState
+
+	cmdChan chan func()
 }
 
-func (w *Worker) eventLoop() {
-	log.Println("Starts the eventloop")
-
-	for {
-		if w.context.profile.connectionState == Unconnected {
-			w.rpcClient.connectRPC()
-		}
-
-		for {
-			time.Sleep(30 * time.Second)
-		}
+func (w *Worker) Run() {
+	for cmd := range w.cmdChan {
+		cmd()
 	}
+}
+
+type getConnectionStatusResp struct {
+	status connectionStatus
+	err    error
+}
+
+func (w *Worker) GetConnectionStatus() getConnectionStatusResp {
+	respChan := make(chan getConnectionStatusResp, 1)
+
+	w.cmdChan <- func() {
+
+		// Required: error cases
+		// Invariants:
+		// Retry:
+
+		respChan <- getConnectionStatusResp{status: w.state.connectionStatus, err: nil}
+	}
+
+	return <-respChan
+}
+
+type assignJobReq struct {
+	workerID int
+}
+
+type assignJobResp struct {
+	err error
+}
+
+func (w *Worker) AssignJob(req assignJobReq) assignJobResp {
+	resp := make(chan assignJobResp, 1)
+
+	w.cmdChan <- func() {
+
+		// Required: error cases
+		// Invariants:
+		// Retry:
+
+		w.state.profile.id = req.workerID
+		w.state.connectionStatus = Connected
+
+		resp <- assignJobResp{err: nil}
+	}
+
+	return <-resp
 }
 
 // ------------------------
@@ -99,10 +138,44 @@ type WorkerRPC struct {
 	w *Worker
 }
 
-func (wrpc *WorkerRPC) connectRPC() {
-	args := AcceptWorkerArgs{}
+// Eventloop iterates to call a series of RPC requests to the coordinator
+// in the strict order.
+// Worker state transitions internally by each RPC call.
+// Main thread runs the event loop.
+// It is independent from the actor thread, which
+// accesses and modifies private worker state.
+func (wrpc *WorkerRPC) Eventloop() {
 
-	reply := AcceptWorerReply{}
+	log.Println("<INFO> Start the event loop")
+	for {
+		wrpc.ConnectRPC()
+
+		// ...
+
+		for {
+			time.Sleep(30 * time.Second) // Simulates a loop.
+		}
+	}
+
+	// log.Println("<INFO> Terminate the event loop")
+}
+
+func (wrpc *WorkerRPC) ConnectRPC() {
+	respFromGetConnectionStatus := wrpc.w.GetConnectionStatus()
+
+	if respFromGetConnectionStatus.err != nil {
+		// Required: error cases
+		// Invariants:
+		// Retry:
+
+	}
+
+	if respFromGetConnectionStatus.err == nil && respFromGetConnectionStatus.status == Connected {
+		return
+	}
+
+	args := AcceptWorkerArgs{}
+	reply := AcceptWorkerReply{}
 
 	ok := wrpc.call(RPCAcceptWorker, &args, &reply)
 
@@ -111,9 +184,15 @@ func (wrpc *WorkerRPC) connectRPC() {
 		return
 	}
 
-	wrpc.w.context.profile.id = reply.WorkerID
-	wrpc.w.context.profile.connectionState = Connected
+	respFromAssignJob := wrpc.w.AssignJob(assignJobReq{workerID: reply.WorkerID})
 
+	if respFromAssignJob.err != nil {
+		// Required: error cases
+		// Invariants:
+		// Retry:
+	}
+
+	// Update the global logger with assigned worker id.
 	prefix := fmt.Sprintf("[ WORKER | PID: %d | ID: %d ] ", os.Getpid(), reply.WorkerID)
 	log.SetPrefix(prefix)
 	log.Printf("<INFO> Worker %d is Connected", reply.WorkerID)
@@ -150,25 +229,26 @@ func MakeWorker(mapf mapFunc, reducef reduceFunc) {
 	log.SetPrefix(prefix)
 
 	w := Worker{
-		context: workerContext{
-			profile: workerProfile{
-				connectionState: Unconnected,
+		state: workerState{
+			profile:          workerProfile{},
+			connectionStatus: Unconnected,
+			currentJob: job{
+				progressionStatus: Unscheduled,
 			},
-
 			mapf:    mapf,
 			reducef: reducef,
 		},
-		currentJob: job{
-			progressionState: Unscheduled,
-		},
-		rpcClient: &WorkerRPC{},
+
+		cmdChan: make(chan func(), 100),
 	}
 
-	w.rpcClient.w = &w
+	wRPC := WorkerRPC{w: &w}
 
 	log.Println("<INFO> Initialized the worker")
 
-	w.eventLoop()
+	go w.Run()
+
+	wRPC.Eventloop()
 }
 
 // ------------------------

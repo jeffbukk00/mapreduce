@@ -22,7 +22,7 @@ const (
 type AcceptWorkerArgs struct{}
 
 // ConnectReply is an return type of RPC method "CoordinatorRPC.Connect"
-type AcceptWorerReply struct {
+type AcceptWorkerReply struct {
 	WorkerID int
 }
 

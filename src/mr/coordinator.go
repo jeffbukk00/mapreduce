@@ -139,6 +139,7 @@ func (c *Coordinator) AcceptWorker() acceptWorkerResp {
 
 		// Required: error cases
 		// Invariant: the number of max workers
+		// Retry:
 
 		respChan <- acceptWorkerResp{id: acceptedWorkerID, err: nil}
 	}
@@ -178,12 +179,15 @@ func (crpc *CoordinatorRPC) server() {
 	}()
 }
 
-func (crpc *CoordinatorRPC) AcceptWorkerRPC(args AcceptWorkerArgs, reply *AcceptWorerReply) error {
+func (crpc *CoordinatorRPC) AcceptWorkerRPC(args AcceptWorkerArgs, reply *AcceptWorkerReply) error {
 
 	resp := crpc.coord.AcceptWorker()
 
-	// Required: error cases
-	// Invariant: the number of max workers
+	if resp.err != nil {
+		// Required: error cases
+		// Invariant: the number of max workers
+		// Retry:
+	}
 
 	// reply
 	reply.WorkerID = resp.id
