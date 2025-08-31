@@ -81,20 +81,15 @@ type workerSet struct {
 	mu         sync.Mutex
 }
 
-type workerPool struct {
-	q *Queue[*worker]
-}
-
 // ------------------------
 // Coordinator-related type definitions
 // ------------------------
 
 // Private state of a coordinator
 type coordinatorState struct {
-	taskFiniteSet      taskSet
-	workerFiniteSet    workerSet
-	idleTaskQueue      taskQueue
-	inactiveWorkerPool workerPool
+	taskFiniteSet   taskSet
+	workerFiniteSet workerSet
+	idleTaskQueue   taskQueue
 }
 
 // Coordinator is a high-level abstraction for internal service state and a RPC server. Publicly exposed to the external.
@@ -154,9 +149,6 @@ func (crpc *CoordinatorRPC) Connect(args ConnectArgs, reply *ConnectReply) error
 	crpc.coord.state.workerFiniteSet.numWorkers++
 	crpc.coord.state.workerFiniteSet.mu.Unlock()
 
-	// equeue a newly connected worker to the worker pool
-	crpc.coord.state.inactiveWorkerPool.q.Enqueue(&connectedWorker)
-
 	// reply
 	reply.WorkerID = connectedWorkerID
 
@@ -179,7 +171,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	nMap := len(files)
 	taskQueueSize := nMap + nReduce
-	workerPoolSize := taskQueueSize
 
 	c := Coordinator{
 		state: coordinatorState{
@@ -195,9 +186,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			},
 			idleTaskQueue: taskQueue{
 				q: NewQueue[*task](taskQueueSize), // (the number of map tasks + the number of reduce tasks)
-			},
-			inactiveWorkerPool: workerPool{
-				q: NewQueue[*worker](workerPoolSize), // (the number of workers)
 			},
 		},
 	}
