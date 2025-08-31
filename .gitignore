@@ -1,6 +1,5 @@
-*.*/
-main/mr-tmp/
-mrtmp.*
-824-mrinput-*.txt
-/mapreduce/src/x.txt
-*.so
+src/main/pg-*.txt
+src/main/*.so
+src/main/test-mr*.sh
+
+src/mrapps
