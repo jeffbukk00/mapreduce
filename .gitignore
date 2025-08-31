@@ -3,3 +3,5 @@ src/main/*.so
 src/main/test-mr*.sh
 
 src/mrapps
+
+.vscode
