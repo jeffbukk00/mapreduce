@@ -11,7 +11,7 @@ import (
 // ------------------------
 
 const (
-	RPCConnect = "CoordinatorRPC.Connect"
+	RPCAcceptWorker = "CoordinatorRPC.AcceptWorkerRPC"
 )
 
 // ------------------------
@@ -19,10 +19,10 @@ const (
 // ------------------------
 
 // ConnectArgs is an argument type of RPC method "CoordinatorRPC.Connect"
-type ConnectArgs struct{}
+type AcceptWorkerArgs struct{}
 
 // ConnectReply is an return type of RPC method "CoordinatorRPC.Connect"
-type ConnectReply struct {
+type AcceptWorerReply struct {
 	WorkerID int
 }
 

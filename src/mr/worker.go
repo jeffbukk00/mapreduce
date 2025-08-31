@@ -100,11 +100,11 @@ type WorkerRPC struct {
 }
 
 func (wrpc *WorkerRPC) connectRPC() {
-	args := ConnectArgs{}
+	args := AcceptWorkerArgs{}
 
-	reply := ConnectReply{}
+	reply := AcceptWorerReply{}
 
-	ok := wrpc.call(RPCConnect, &args, &reply)
+	ok := wrpc.call(RPCAcceptWorker, &args, &reply)
 
 	if !ok {
 		log.Println("<ERROR> Failed to connect to the coordinator")
@@ -116,7 +116,7 @@ func (wrpc *WorkerRPC) connectRPC() {
 
 	prefix := fmt.Sprintf("[ WORKER | PID: %d | ID: %d ] ", os.Getpid(), reply.WorkerID)
 	log.SetPrefix(prefix)
-	log.Println("Connected")
+	log.Printf("<INFO> Worker %d is Connected", reply.WorkerID)
 }
 
 func (wrpc *WorkerRPC) call(rpcname string, args interface{}, reply interface{}) bool {

@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
-	"sync"
 )
 
 // ------------------------
@@ -46,7 +45,13 @@ type task struct {
 	progressionStatus taskProgressionStatus
 	inputPath         []string
 	requiredInputs    int
-	scheduledWith     *worker
+	scheduledWith     []*worker // Multiple workers can be scheduled with same task. As backup tasks for speculative execution.
+	// A task can be completed by only one worker.
+	// This field is not overwritten by backup completions,
+	// ensuring deduplication under speculative execution.
+	// The only exception is when rescheduling after the
+	// original completing worker has failed.
+	completedWith *worker
 }
 
 // taskSet tracks the state of all tasks in one place.
@@ -59,7 +64,7 @@ type taskSet struct {
 }
 
 type taskQueue struct {
-	q *Queue[*task]
+	q []*task
 }
 
 // ------------------------
@@ -78,7 +83,6 @@ type worker struct {
 type workerSet struct {
 	numWorkers int
 	workers    []*worker
-	mu         sync.Mutex
 }
 
 // ------------------------
@@ -95,11 +99,51 @@ type coordinatorState struct {
 // Coordinator is a high-level abstraction for internal service state and a RPC server. Publicly exposed to the external.
 type Coordinator struct {
 	state coordinatorState
+
+	cmdChan chan func()
+}
+
+func (c *Coordinator) Run() {
+	for cmd := range c.cmdChan {
+		cmd()
+	}
 }
 
 func (c *Coordinator) Done() bool {
 	ret := false
 	return ret
+}
+
+type acceptWorkerResp struct {
+	id  int
+	err error
+}
+
+func (c *Coordinator) AcceptWorker() acceptWorkerResp {
+	respChan := make(chan acceptWorkerResp, 1)
+
+	c.cmdChan <- func() {
+		acceptedWorkerID := c.state.workerFiniteSet.numWorkers
+
+		acceptededWorker := worker{
+			id:               acceptedWorkerID,
+			livenessStatus:   Alive,
+			activenessStatus: Inactive,
+			scheduledWith:    nil,
+			tasksCompleted:   make([]*task, 0),
+		}
+
+		c.state.workerFiniteSet.workers = append(c.state.workerFiniteSet.workers, &acceptededWorker)
+
+		c.state.workerFiniteSet.numWorkers++
+
+		// Required: error cases
+		// Invariant: the number of max workers
+
+		respChan <- acceptWorkerResp{id: acceptedWorkerID, err: nil}
+	}
+
+	return <-respChan
 }
 
 // ------------------------
@@ -134,25 +178,17 @@ func (crpc *CoordinatorRPC) server() {
 	}()
 }
 
-func (crpc *CoordinatorRPC) Connect(args ConnectArgs, reply *ConnectReply) error {
-	// Append a newly connected worker to the worker set.
-	crpc.coord.state.workerFiniteSet.mu.Lock()
-	connectedWorkerID := crpc.coord.state.workerFiniteSet.numWorkers
-	connectedWorker := worker{
-		id:               connectedWorkerID,
-		livenessStatus:   Alive,
-		activenessStatus: Inactive,
-		scheduledWith:    nil,
-		tasksCompleted:   make([]*task, 0),
-	}
-	crpc.coord.state.workerFiniteSet.workers = append(crpc.coord.state.workerFiniteSet.workers, &connectedWorker)
-	crpc.coord.state.workerFiniteSet.numWorkers++
-	crpc.coord.state.workerFiniteSet.mu.Unlock()
+func (crpc *CoordinatorRPC) AcceptWorkerRPC(args AcceptWorkerArgs, reply *AcceptWorerReply) error {
+
+	resp := crpc.coord.AcceptWorker()
+
+	// Required: error cases
+	// Invariant: the number of max workers
 
 	// reply
-	reply.WorkerID = connectedWorkerID
+	reply.WorkerID = resp.id
 
-	log.Printf("<INFO> Worker %d is initialized\n", connectedWorkerID)
+	log.Printf("<INFO> Worker %d is initialized\n", resp.id)
 
 	return nil
 }
@@ -170,7 +206,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	log.SetPrefix(prefix)
 
 	nMap := len(files)
-	taskQueueSize := nMap + nReduce
 
 	c := Coordinator{
 		state: coordinatorState{
@@ -185,9 +220,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 				workers:    make([]*worker, 0),
 			},
 			idleTaskQueue: taskQueue{
-				q: NewQueue[*task](taskQueueSize), // (the number of map tasks + the number of reduce tasks)
+				q: make([]*task, 0),
 			},
 		},
+		cmdChan: make(chan func(), 100),
 	}
 
 	cRPC := &CoordinatorRPC{
@@ -201,10 +237,13 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			progressionStatus: Idle,
 			inputPath:         []string{files[i]},
 			requiredInputs:    1,
-			scheduledWith:     nil,
+			scheduledWith:     make([]*worker, 0),
+			completedWith:     nil,
 		}
 
 		c.state.taskFiniteSet.mapTasks[i] = mt
+
+		c.state.idleTaskQueue.q = append(c.state.idleTaskQueue.q, mt)
 	}
 
 	for i := 0; i < c.state.taskFiniteSet.reduceTasksToComplete; i++ {
@@ -218,9 +257,15 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		}
 
 		c.state.taskFiniteSet.reduceTasks[i] = rt
+
+		c.state.idleTaskQueue.q = append(c.state.idleTaskQueue.q, rt)
 	}
 
 	log.Println("<INFO> Initialized the coordinator")
+
+	go c.Run()
+
 	cRPC.server()
+
 	return &c
 }
