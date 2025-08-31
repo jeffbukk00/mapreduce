@@ -114,6 +114,38 @@ func (c *Coordinator) Done() bool {
 	return ret
 }
 
+type acceptWorkerResp struct {
+	id  int
+	err error
+}
+
+func (c *Coordinator) AcceptWorker() acceptWorkerResp {
+	respChan := make(chan acceptWorkerResp, 1)
+
+	c.cmdChan <- func() {
+		acceptedWorkerID := c.state.workerFiniteSet.numWorkers
+
+		acceptededWorker := worker{
+			id:               acceptedWorkerID,
+			livenessStatus:   Alive,
+			activenessStatus: Inactive,
+			scheduledWith:    nil,
+			tasksCompleted:   make([]*task, 0),
+		}
+
+		c.state.workerFiniteSet.workers = append(c.state.workerFiniteSet.workers, &acceptededWorker)
+
+		c.state.workerFiniteSet.numWorkers++
+
+		// Required: error cases
+		// Invariant: the number of max workers
+
+		respChan <- acceptWorkerResp{id: acceptedWorkerID, err: nil}
+	}
+
+	return <-respChan
+}
+
 // ------------------------
 // RPC server definitions for a coordinator. Separation of networking concerns.
 // ------------------------
@@ -146,24 +178,17 @@ func (crpc *CoordinatorRPC) server() {
 	}()
 }
 
-func (crpc *CoordinatorRPC) Connect(args ConnectArgs, reply *ConnectReply) error {
-	// Append a newly connected worker to the worker set.
+func (crpc *CoordinatorRPC) AcceptWorkerRPC(args AcceptWorkerArgs, reply *AcceptWorerReply) error {
 
-	connectedWorkerID := crpc.coord.state.workerFiniteSet.numWorkers
-	connectedWorker := worker{
-		id:               connectedWorkerID,
-		livenessStatus:   Alive,
-		activenessStatus: Inactive,
-		scheduledWith:    nil,
-		tasksCompleted:   make([]*task, 0),
-	}
-	crpc.coord.state.workerFiniteSet.workers = append(crpc.coord.state.workerFiniteSet.workers, &connectedWorker)
-	crpc.coord.state.workerFiniteSet.numWorkers++
+	resp := crpc.coord.AcceptWorker()
+
+	// Required: error cases
+	// Invariant: the number of max workers
 
 	// reply
-	reply.WorkerID = connectedWorkerID
+	reply.WorkerID = resp.id
 
-	log.Printf("<INFO> Worker %d is initialized\n", connectedWorkerID)
+	log.Printf("<INFO> Worker %d is initialized\n", resp.id)
 
 	return nil
 }
