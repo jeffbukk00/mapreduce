@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
-	"sync"
 )
 
 // ------------------------
@@ -46,7 +45,13 @@ type task struct {
 	progressionStatus taskProgressionStatus
 	inputPath         []string
 	requiredInputs    int
-	scheduledWith     *worker
+	scheduledWith     []*worker // Multiple workers can be scheduled with same task. As backup tasks for speculative execution.
+	// A task can be completed by only one worker.
+	// This field is not overwritten by backup completions,
+	// ensuring deduplication under speculative execution.
+	// The only exception is when rescheduling after the
+	// original completing worker has failed.
+	completedWith *worker
 }
 
 // taskSet tracks the state of all tasks in one place.
@@ -78,7 +83,6 @@ type worker struct {
 type workerSet struct {
 	numWorkers int
 	workers    []*worker
-	mu         sync.Mutex
 }
 
 // ------------------------
@@ -136,7 +140,7 @@ func (crpc *CoordinatorRPC) server() {
 
 func (crpc *CoordinatorRPC) Connect(args ConnectArgs, reply *ConnectReply) error {
 	// Append a newly connected worker to the worker set.
-	crpc.coord.state.workerFiniteSet.mu.Lock()
+
 	connectedWorkerID := crpc.coord.state.workerFiniteSet.numWorkers
 	connectedWorker := worker{
 		id:               connectedWorkerID,
@@ -147,7 +151,6 @@ func (crpc *CoordinatorRPC) Connect(args ConnectArgs, reply *ConnectReply) error
 	}
 	crpc.coord.state.workerFiniteSet.workers = append(crpc.coord.state.workerFiniteSet.workers, &connectedWorker)
 	crpc.coord.state.workerFiniteSet.numWorkers++
-	crpc.coord.state.workerFiniteSet.mu.Unlock()
 
 	// reply
 	reply.WorkerID = connectedWorkerID
@@ -200,7 +203,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			progressionStatus: Idle,
 			inputPath:         []string{files[i]},
 			requiredInputs:    1,
-			scheduledWith:     nil,
+			scheduledWith:     make([]*worker, 0),
+			completedWith:     nil,
 		}
 
 		c.state.taskFiniteSet.mapTasks[i] = mt
