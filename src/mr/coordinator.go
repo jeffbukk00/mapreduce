@@ -59,7 +59,7 @@ type taskSet struct {
 }
 
 type taskQueue struct {
-	q *Queue[*task]
+	q []*task
 }
 
 // ------------------------
@@ -170,7 +170,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	log.SetPrefix(prefix)
 
 	nMap := len(files)
-	taskQueueSize := nMap + nReduce
 
 	c := Coordinator{
 		state: coordinatorState{
@@ -185,7 +184,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 				workers:    make([]*worker, 0),
 			},
 			idleTaskQueue: taskQueue{
-				q: NewQueue[*task](taskQueueSize), // (the number of map tasks + the number of reduce tasks)
+				q: make([]*task, 0), // (the number of map tasks + the number of reduce tasks)
 			},
 		},
 	}
