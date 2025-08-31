@@ -99,6 +99,14 @@ type coordinatorState struct {
 // Coordinator is a high-level abstraction for internal service state and a RPC server. Publicly exposed to the external.
 type Coordinator struct {
 	state coordinatorState
+
+	cmdChan chan func()
+}
+
+func (c *Coordinator) Run() {
+	for cmd := range c.cmdChan {
+		cmd()
+	}
 }
 
 func (c *Coordinator) Done() bool {
@@ -187,9 +195,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 				workers:    make([]*worker, 0),
 			},
 			idleTaskQueue: taskQueue{
-				q: make([]*task, 0), // (the number of map tasks + the number of reduce tasks)
+				q: make([]*task, 0),
 			},
 		},
+		cmdChan: make(chan func(), 100),
 	}
 
 	cRPC := &CoordinatorRPC{
@@ -208,6 +217,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		}
 
 		c.state.taskFiniteSet.mapTasks[i] = mt
+
+		c.state.idleTaskQueue.q = append(c.state.idleTaskQueue.q, mt)
 	}
 
 	for i := 0; i < c.state.taskFiniteSet.reduceTasksToComplete; i++ {
@@ -221,9 +232,15 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		}
 
 		c.state.taskFiniteSet.reduceTasks[i] = rt
+
+		c.state.idleTaskQueue.q = append(c.state.idleTaskQueue.q, rt)
 	}
 
 	log.Println("<INFO> Initialized the coordinator")
+
+	go c.Run()
+
 	cRPC.server()
+
 	return &c
 }
