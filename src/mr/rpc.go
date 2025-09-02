@@ -11,7 +11,8 @@ import (
 // ------------------------
 
 const (
-	RPCAcceptWorker = "CoordinatorRPC.AcceptWorkerRPC"
+	RPCConnect  = "CoordinatorRPC.Connect"
+	RPCSchedule = "CoordinatorRPC.Schedule"
 )
 
 // ------------------------
@@ -19,11 +20,21 @@ const (
 // ------------------------
 
 // ConnectArgs is an argument type of RPC method "CoordinatorRPC.Connect"
-type AcceptWorkerArgs struct{}
+type ConnectArgs struct{}
 
 // ConnectReply is an return type of RPC method "CoordinatorRPC.Connect"
-type AcceptWorkerReply struct {
+type ConnectReply struct {
 	WorkerID int
+}
+
+// ScheduleArgs is an argument type of RPC method "CoordinatorRPC.Connect"
+type ScheduleArgs struct {
+	WorkerID int
+}
+
+// ScheduleReply is an return type of RPC method "CoordinatorRPC.Connect"
+type ScheduleReply struct {
+	ScheduledTask Job
 }
 
 func CoordinatorSock() string {

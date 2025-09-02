@@ -48,12 +48,15 @@ type reduceFunc func(string, []string) string
 // ------------------------
 // Job-related type definitions
 // ------------------------
-type job struct {
-	class             TaskClass
-	seq               int
-	progressionStatus jobProgressionStatus
-	inputPath         []string
-	requiredInputs    int
+
+// Job represent the state of currently progressing task in the worker.
+// It is scheduled by the coorinator.
+type Job struct {
+	Class             TaskClass
+	Seq               int
+	progressionStatus jobProgressionStatus // It is not included in the RPC args and reply.
+	InputPath         []string
+	RequiredInputs    int
 }
 
 // ------------------------
@@ -66,7 +69,7 @@ type workerProfile struct {
 type workerState struct {
 	profile          workerProfile
 	connectionStatus connectionStatus
-	currentJob       job
+	currentJob       Job
 	mapf             mapFunc
 	reducef          reduceFunc
 }
@@ -101,6 +104,29 @@ func (w *Worker) GetConnectionStatus() getConnectionStatusResp {
 	}
 
 	return <-respChan
+}
+
+type getJobProgressionStatusResp struct {
+	status jobProgressionStatus
+	err error
+}
+
+func (w *Worker) getJobProgressionStatus() getJobProgressionStatusResp {
+	respChan := make(chan getJobProgressionStatusResp, 1)
+
+	w.cmdChan <- func() {
+
+		// Required: error cases
+		// Invariants:
+		// Retry:
+
+		respChan <- getJobProgressionStatusResp{
+			status: w.state.currentJob.progressionStatus,
+			err: nil
+		}
+	}
+
+	return <- respChan
 }
 
 type assignJobReq struct {
@@ -174,10 +200,10 @@ func (wrpc *WorkerRPC) ConnectRPC() {
 		return
 	}
 
-	args := AcceptWorkerArgs{}
-	reply := AcceptWorkerReply{}
+	args := ConnectArgs{}
+	reply := ConnectReply{}
 
-	ok := wrpc.call(RPCAcceptWorker, &args, &reply)
+	ok := wrpc.call(RPCConnect, &args, &reply)
 
 	if !ok {
 		log.Println("<ERROR> Failed to connect to the coordinator")
@@ -196,6 +222,20 @@ func (wrpc *WorkerRPC) ConnectRPC() {
 	prefix := fmt.Sprintf("[ WORKER | PID: %d | ID: %d ] ", os.Getpid(), reply.WorkerID)
 	log.SetPrefix(prefix)
 	log.Printf("<INFO> Worker %d is Connected", reply.WorkerID)
+}
+
+func (wrpc *WorkerRPC) ScheduleRPC() {
+	respFromGetConnectionStatus := wrpc.w.GetConnectionStatus()
+
+	args := ScheduleArgs{}
+	reply := ScheduleReply{}
+
+	ok := wrpc.call(RPCSchedule, &args, &reply)
+
+	if !ok {
+		log.Println("<ERROR> Failed to schedule")
+		return
+	}
 }
 
 func (wrpc *WorkerRPC) call(rpcname string, args interface{}, reply interface{}) bool {
@@ -232,7 +272,7 @@ func MakeWorker(mapf mapFunc, reducef reduceFunc) {
 		state: workerState{
 			profile:          workerProfile{},
 			connectionStatus: Unconnected,
-			currentJob: job{
+			currentJob: Job{
 				progressionStatus: Unscheduled,
 			},
 			mapf:    mapf,

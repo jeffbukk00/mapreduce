@@ -179,7 +179,7 @@ func (crpc *CoordinatorRPC) server() {
 	}()
 }
 
-func (crpc *CoordinatorRPC) AcceptWorkerRPC(args AcceptWorkerArgs, reply *AcceptWorkerReply) error {
+func (crpc *CoordinatorRPC) Connect(args ConnectArgs, reply *ConnectReply) error {
 
 	resp := crpc.coord.AcceptWorker()
 
