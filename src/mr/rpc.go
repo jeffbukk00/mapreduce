@@ -24,7 +24,7 @@ type ConnectArgs struct{}
 
 // ConnectReply is an return type of RPC method "CoordinatorRPC.Connect"
 type ConnectReply struct {
-	WorkerID int
+	Profile WorkerProfile
 }
 
 // ScheduleArgs is an argument type of RPC method "CoordinatorRPC.Connect"
@@ -34,7 +34,7 @@ type ScheduleArgs struct {
 
 // ScheduleReply is an return type of RPC method "CoordinatorRPC.Connect"
 type ScheduleReply struct {
-	ScheduledTask Job
+	Task Job
 }
 
 func CoordinatorSock() string {

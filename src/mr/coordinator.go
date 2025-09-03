@@ -190,7 +190,7 @@ func (crpc *CoordinatorRPC) Connect(args ConnectArgs, reply *ConnectReply) error
 	}
 
 	// reply
-	reply.WorkerID = resp.id
+	reply.Profile.ID = resp.id
 
 	log.Printf("<INFO> Worker %d is initialized\n", resp.id)
 

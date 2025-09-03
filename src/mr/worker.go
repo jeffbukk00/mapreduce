@@ -6,28 +6,66 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sync"
 	"time"
 )
 
 // ------------------------
 // Private constants
 // ------------------------
-type connectionStatus int
+type executionStage int
 
 const (
-	Unconnected connectionStatus = iota
-	Connected
+	StageConnect executionStage = iota
+	StageSchedule
+	StageFetchInput
+	StageProgressTask
+	StageCommitOutput
+	StageTerminateLoop
 )
 
-type jobProgressionStatus int
+// ------------------------
+// Type definitions for synchronization primitive
+// ------------------------
 
-const (
-	Unscheduled jobProgressionStatus = iota
-	Scheduled
-	InputFetched
-	TaskProcessed
-	OutputCommitted
-)
+type ThreadLifecycleBarrier struct {
+	ready                  sync.WaitGroup
+	done                   sync.WaitGroup
+	start                  chan struct{}
+	numThreadsToBeSyncWith int
+}
+
+func NewThreadLifeCycleBarrier(numThreads int) *ThreadLifecycleBarrier {
+	newBarrier := ThreadLifecycleBarrier{
+		ready:                  sync.WaitGroup{},
+		done:                   sync.WaitGroup{},
+		start:                  make(chan struct{}),
+		numThreadsToBeSyncWith: numThreads,
+	}
+
+	newBarrier.ready.Add(newBarrier.numThreadsToBeSyncWith)
+	newBarrier.done.Add(newBarrier.numThreadsToBeSyncWith)
+
+	return &newBarrier
+}
+
+func (b *ThreadLifecycleBarrier) ReadySig() {
+	b.ready.Done()
+	<-b.start
+}
+
+func (b *ThreadLifecycleBarrier) DoneSig() {
+	b.done.Done()
+}
+
+func (b *ThreadLifecycleBarrier) Ready() {
+	b.ready.Wait()
+	close(b.start)
+}
+
+func (b *ThreadLifecycleBarrier) Done() {
+	b.done.Wait()
+}
 
 // ------------------------
 // Type definitions for user-defined map and reduce functions
@@ -46,215 +84,332 @@ type mapFunc func(string, string) []KeyValue
 type reduceFunc func(string, []string) string
 
 // ------------------------
-// Job-related type definitions
+// Job type definitions
 // ------------------------
 
 // Job represent the state of currently progressing task in the worker.
 // It is scheduled by the coorinator.
 type Job struct {
-	Class             TaskClass
-	Seq               int
-	progressionStatus jobProgressionStatus // It is not included in the RPC args and reply.
-	InputPath         []string
-	RequiredInputs    int
+	Class          TaskClass
+	Seq            int
+	InputPath      []string
+	RequiredInputs int
 }
 
 // ------------------------
-// Worker-related type definitions
+// State manager type definitions
 // ------------------------
-type workerProfile struct {
-	id int
+
+// WorkerProfile represents worker metatdata assigned by the coordinator.
+type WorkerProfile struct {
+	ID int
 }
 
 type workerState struct {
-	profile          workerProfile
-	connectionStatus connectionStatus
-	currentJob       Job
-	mapf             mapFunc
-	reducef          reduceFunc
+	profile    WorkerProfile
+	currentJob Job
+	mapf       mapFunc
+	reducef    reduceFunc
 }
 
+// Worker owns the shared state.
+// No other threads can access or modify the shared state directly.
+// It coordinates cross-cutting concerns across all other threads.
+// It holds references to these threads and broadcasts updates to them as needed.
 type Worker struct {
 	state workerState
 
-	cmdChan chan func()
+	stateOpChan chan func()
+
+	executionLoop *executionLoop
+	signalHandler *signalHandler
+	shuffleServer *shuffleServer
+
+	barrierWithParent   *ThreadLifecycleBarrier
+	barrierWithChildren *ThreadLifecycleBarrier
 }
 
 func (w *Worker) Run() {
-	for cmd := range w.cmdChan {
-		cmd()
-	}
-}
+	defer w.barrierWithParent.DoneSig()
 
-type getConnectionStatusResp struct {
-	status connectionStatus
-	err    error
-}
+	log.Println("<INFO> State manager thread: Intialized")
 
-func (w *Worker) GetConnectionStatus() getConnectionStatusResp {
-	respChan := make(chan getConnectionStatusResp, 1)
+	w.barrierWithParent.ReadySig()
 
-	w.cmdChan <- func() {
+	// Lifecycle synchronization barrier:
+	// Parent thread: State manager thread
+	// Child thread: Execution loop thread, Signal handler thread, Shuffle server thread
+	b := NewThreadLifeCycleBarrier(3)
+	w.barrierWithChildren = b
 
-		// Required: error cases
-		// Invariants:
-		// Retry:
+	w.executionLoop.barrierWithParent = b
+	w.signalHandler.barrierWithParent = b
+	w.shuffleServer.barrierWithParent = b
 
-		respChan <- getConnectionStatusResp{status: w.state.connectionStatus, err: nil}
-	}
+	go w.executionLoop.run()
+	go w.signalHandler.run()
+	go w.shuffleServer.run()
 
-	return <-respChan
-}
+	b.Ready()
 
-type getJobProgressionStatusResp struct {
-	status jobProgressionStatus
-	err error
-}
+	log.Println("<INFO> Stage manager thread: Synchronized with child threads: Execution loop thread, Signal handler thread, Shuffle server thread")
 
-func (w *Worker) getJobProgressionStatus() getJobProgressionStatusResp {
-	respChan := make(chan getJobProgressionStatusResp, 1)
-
-	w.cmdChan <- func() {
-
-		// Required: error cases
-		// Invariants:
-		// Retry:
-
-		respChan <- getJobProgressionStatusResp{
-			status: w.state.currentJob.progressionStatus,
-			err: nil
-		}
+	for stateOp := range w.stateOpChan {
+		stateOp()
 	}
 
-	return <- respChan
+	b.Done()
+
+	log.Println("<INFO> State manager thread: Terminated")
+}
+
+func (w *Worker) Terminate() {
+
+	w.stateOpChan <- func() {
+		w.executionLoop.quitLoop()
+		w.signalHandler.quitSignalHandler()
+		w.shuffleServer.quitShuffleServer()
+
+		w.barrierWithChildren.Done()
+
+		close(w.stateOpChan)
+	}
+
+	// No synchronization with the caller.
+}
+
+type assignWorkerProfileReq struct {
+	profile WorkerProfile
+}
+
+func (w *Worker) AssignWorkerProfile(req assignWorkerProfileReq) {
+	done := make(chan struct{})
+
+	w.stateOpChan <- func() {
+
+		// Warning: This is a shallow copy.
+		// But, there is a guarantee of no shared references.
+		w.state.profile = req.profile
+
+		close(done)
+	}
+
+	<-done
 }
 
 type assignJobReq struct {
-	workerID int
+	job Job
 }
 
-type assignJobResp struct {
-	err error
-}
+func (w *Worker) AssignJob(req assignJobReq) {
+	done := make(chan struct{})
 
-func (w *Worker) AssignJob(req assignJobReq) assignJobResp {
-	resp := make(chan assignJobResp, 1)
+	w.stateOpChan <- func() {
 
-	w.cmdChan <- func() {
+		// Warning: This is a shallow copy.
+		// But, there is a guarantee of no shared references.
+		w.state.currentJob = req.job
 
-		// Required: error cases
-		// Invariants:
-		// Retry:
-
-		w.state.profile.id = req.workerID
-		w.state.connectionStatus = Connected
-
-		resp <- assignJobResp{err: nil}
+		close(done)
 	}
 
-	return <-resp
+	<-done
 }
 
 // ------------------------
-// RPC client definitions for a worker. Separation of networking concerns.
+// Execution loop type definitions
 // ------------------------
 
-// WorkerRPC represents a RPC client.
-type WorkerRPC struct {
+// ExecutionLoop loops a sequence of execution stages in strict order.
+type executionLoop struct {
+	stage        executionStage
+	isTerminated bool
+
+	stageChan chan executionStage
+
 	w *Worker
+
+	barrierWithParent *ThreadLifecycleBarrier
 }
 
-// Eventloop iterates to call a series of RPC requests to the coordinator
-// in the strict order.
-// Worker state transitions internally by each RPC call.
-// Main thread runs the event loop.
-// It is independent from the actor thread, which
-// accesses and modifies private worker state.
-func (wrpc *WorkerRPC) Eventloop() {
+func (el *executionLoop) run() {
 
-	log.Println("<INFO> Start the event loop")
-	for {
-		wrpc.ConnectRPC()
+	defer el.barrierWithParent.DoneSig()
 
-		// ...
+	// Buffered Channel
+	// It prevents for the state manager thread from being blocked
+	el.stageChan = make(chan executionStage, 10)
 
-		for {
-			time.Sleep(30 * time.Second) // Simulates a loop.
-		}
-	}
+	log.Println("<INFO> Execution Loop thread: Intialized")
 
-	// log.Println("<INFO> Terminate the event loop")
+	el.barrierWithParent.ReadySig()
+
+	el.startLoop()
+
+	log.Println("<INFO> Execution loop thread: Terminated")
 }
 
-func (wrpc *WorkerRPC) ConnectRPC() {
-	respFromGetConnectionStatus := wrpc.w.GetConnectionStatus()
-
-	if respFromGetConnectionStatus.err != nil {
-		// Required: error cases
-		// Invariants:
-		// Retry:
-
-	}
-
-	if respFromGetConnectionStatus.err == nil && respFromGetConnectionStatus.status == Connected {
-		return
-	}
-
-	args := ConnectArgs{}
-	reply := ConnectReply{}
-
-	ok := wrpc.call(RPCConnect, &args, &reply)
-
-	if !ok {
-		log.Println("<ERROR> Failed to connect to the coordinator")
-		return
-	}
-
-	respFromAssignJob := wrpc.w.AssignJob(assignJobReq{workerID: reply.WorkerID})
-
-	if respFromAssignJob.err != nil {
-		// Required: error cases
-		// Invariants:
-		// Retry:
-	}
-
-	// Update the global logger with assigned worker id.
-	prefix := fmt.Sprintf("[ WORKER | PID: %d | ID: %d ] ", os.Getpid(), reply.WorkerID)
-	log.SetPrefix(prefix)
-	log.Printf("<INFO> Worker %d is Connected", reply.WorkerID)
-}
-
-func (wrpc *WorkerRPC) ScheduleRPC() {
-	respFromGetConnectionStatus := wrpc.w.GetConnectionStatus()
-
-	args := ScheduleArgs{}
-	reply := ScheduleReply{}
-
-	ok := wrpc.call(RPCSchedule, &args, &reply)
-
-	if !ok {
-		log.Println("<ERROR> Failed to schedule")
-		return
-	}
-}
-
-func (wrpc *WorkerRPC) call(rpcname string, args interface{}, reply interface{}) bool {
+func (el *executionLoop) call(rpcname string, args interface{}, reply interface{}) error {
 
 	sockname := CoordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		log.Fatal("<FATAL> Execution loop thread: Connect to the coordinator: ", err)
 	}
-	defer c.Close()
+	defer c.Close() // Open and close a TCP connection per a RPC request.
 
 	err = c.Call(rpcname, args, reply)
-	if err == nil {
-		return true
+
+	return err
+}
+
+func (el *executionLoop) startLoop() {
+
+	log.Println("<INFO> Execution loop thread: Start to loop")
+
+	var e executionStage
+
+	el.stageChan <- StageConnect
+
+	for !el.isTerminated {
+		e = <-el.stageChan
+
+		el.stage = e
+
+		switch e {
+		case StageConnect:
+			log.Println("<INFO> Execution loop thread: Is at the Connect stage")
+			el.connect()
+		case StageSchedule:
+			log.Println("<INFO> Execution loop thread: Is at the Schedule stage")
+			el.schedule()
+		case StageFetchInput:
+			log.Println("<INFO> Execution loop thread: Is at the FetchInput stage")
+			el.fetchInput()
+		case StageProgressTask:
+			log.Println("<INFO> Execution loop thread: Is at the ProgressTask stage")
+			el.processTask()
+		case StageCommitOutput:
+			log.Println("<INFO> Execution loop thread: Is at the CommitOutput stage")
+			el.commitOutput()
+		case StageTerminateLoop:
+			log.Println("<INFO> Execution loop thread: Is at the TerminateLoop stage")
+			el.isTerminated = true // Propagate a termination.
+		}
 	}
 
-	fmt.Println(err)
-	return false
+	log.Println("<INFO> Execution loop thread: Stop to loop")
 }
+
+func (el *executionLoop) connect() {
+
+	args := ConnectArgs{}
+	reply := ConnectReply{}
+
+	err := el.call(RPCConnect, &args, &reply)
+
+	if err != nil {
+		// Fault tolerance: Retry policy is required.
+		log.Println("<ERROR> Execution loop thread: Failed to connect to the coordinator")
+		return
+	}
+
+	el.w.AssignWorkerProfile(assignWorkerProfileReq{profile: reply.Profile})
+
+	// Update the global logger with assigned worker id.
+	prefix := fmt.Sprintf("[ WORKER | PID: %d | ID: %d ] ", os.Getpid(), reply.Profile.ID)
+	log.SetPrefix(prefix)
+	log.Printf("<INFO> Execution loop thread: Worker %d is Connected", reply.Profile.ID)
+
+	el.stageChan <- StageSchedule
+}
+
+func (el *executionLoop) schedule() {
+	args := ScheduleArgs{}
+	reply := ScheduleReply{}
+
+	err := el.call(RPCSchedule, &args, &reply)
+
+	if err != nil {
+		// Fault tolerance: Retry policy is required.
+		log.Println("<ERROR> Execution loop thread: Failed to schedule")
+		return
+	}
+
+	el.w.AssignJob(assignJobReq{job: reply.Task})
+
+	el.stageChan <- StageFetchInput
+}
+
+func (el *executionLoop) fetchInput() {
+	el.stageChan <- StageProgressTask
+}
+
+func (el *executionLoop) processTask() {
+	el.stageChan <- StageCommitOutput
+}
+
+func (el *executionLoop) commitOutput() {
+
+	el.stageChan <- StageSchedule // Loop. Return to StageSchedule.
+}
+
+func (el *executionLoop) quitLoop() {
+	// Notified by the signal handler.
+	el.stageChan <- StageTerminateLoop
+}
+
+// ------------------------
+// Signal Handler type definitions
+// ------------------------
+type signalHandler struct {
+	w *Worker
+
+	barrierWithParent *ThreadLifecycleBarrier
+}
+
+func (sh *signalHandler) run() {
+	defer sh.barrierWithParent.DoneSig()
+
+	log.Println("<INFO> Signal handler thread: Intialized")
+
+	sh.barrierWithParent.ReadySig()
+
+	sh.notifyTerminationToStateManager()
+
+	log.Println("<INFO> Signal handler thread: Terminated")
+
+}
+
+func (sh *signalHandler) quitSignalHandler() {}
+
+func (sh *signalHandler) notifyTerminationToStateManager() {
+	time.Sleep(time.Second * 20)
+	sh.w.Terminate()
+}
+
+// ------------------------
+// Type definitions for the shuffle server
+// ------------------------
+type shuffleServer struct {
+	w *Worker
+
+	barrierWithParent *ThreadLifecycleBarrier
+}
+
+func (ss *shuffleServer) run() {
+	defer ss.barrierWithParent.DoneSig()
+
+	log.Println("<INFO> Shuffle server thread: Intialized")
+
+	ss.barrierWithParent.ReadySig()
+
+	time.Sleep(time.Second * 5)
+
+	log.Println("<INFO> Shuffle server thread: Terminated")
+}
+
+func (ss *shuffleServer) quitShuffleServer() {}
 
 // ------------------------
 // Initialization of a worker process
@@ -262,6 +417,7 @@ func (wrpc *WorkerRPC) call(rpcname string, args interface{}, reply interface{})
 
 // MakeWorker initializes data structures for internal service state. This is the actual entry point of the worker process.
 func MakeWorker(mapf mapFunc, reducef reduceFunc) {
+
 	// Logger initialization
 	prefix := fmt.Sprintf("[ WORKER | PID: %d | ID: unassigned ] ", os.Getpid())
 	log.SetOutput(os.Stdout)
@@ -270,25 +426,49 @@ func MakeWorker(mapf mapFunc, reducef reduceFunc) {
 
 	w := Worker{
 		state: workerState{
-			profile:          workerProfile{},
-			connectionStatus: Unconnected,
-			currentJob: Job{
-				progressionStatus: Unscheduled,
-			},
-			mapf:    mapf,
-			reducef: reducef,
+			profile:    WorkerProfile{},
+			currentJob: Job{},
+			mapf:       mapf,
+			reducef:    reducef,
 		},
 
-		cmdChan: make(chan func(), 100),
+		stateOpChan: make(chan func(), 100),
 	}
 
-	wRPC := WorkerRPC{w: &w}
+	wExecutionLoop := executionLoop{
+		w: &w,
+	}
 
-	log.Println("<INFO> Initialized the worker")
+	wSignalHandler := signalHandler{
+		w: &w,
+	}
+
+	wShuffleServer := shuffleServer{
+		w: &w,
+	}
+
+	w.executionLoop = &wExecutionLoop
+	w.signalHandler = &wSignalHandler
+	w.shuffleServer = &wShuffleServer
+
+	log.Println("<INFO> Main thread: Initialized")
+
+	// Lifecycle synchronization barrier
+	// Parent thread: Main thread
+	// Child thread: State manager thread
+	b := NewThreadLifeCycleBarrier(1)
+
+	w.barrierWithParent = b
 
 	go w.Run()
 
-	wRPC.Eventloop()
+	b.Ready()
+
+	log.Println("<INFO> Main thread: Synchronized with child threads: State manager thread")
+
+	b.Done()
+
+	log.Println("<INFO> Main thread: Main thread: Terminated")
 }
 
 // ------------------------
