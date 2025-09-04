@@ -2,6 +2,7 @@
 package mr
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -46,6 +47,7 @@ type task struct {
 	inputPath         []string
 	requiredInputs    int
 	scheduledWith     []*worker // Multiple workers can be scheduled with same task. As backup tasks for speculative execution.
+
 	// A task can be completed by only one worker.
 	// This field is not overwritten by backup completions,
 	// ensuring deduplication under speculative execution.
@@ -100,12 +102,15 @@ type coordinatorState struct {
 type Coordinator struct {
 	state coordinatorState
 
-	cmdChan chan func()
+	stateOpChan chan func()
+
+	coordinatorServer *CoordinatorServer
+	workerScanner     *workerScanner
 }
 
 func (c *Coordinator) Run() {
-	for cmd := range c.cmdChan {
-		cmd()
+	for stateOp := range c.stateOpChan {
+		stateOp()
 	}
 }
 
@@ -115,14 +120,13 @@ func (c *Coordinator) Done() bool {
 }
 
 type acceptWorkerResp struct {
-	id  int
-	err error
+	profile WorkerProfile
 }
 
 func (c *Coordinator) AcceptWorker() acceptWorkerResp {
 	respChan := make(chan acceptWorkerResp, 1)
 
-	c.cmdChan <- func() {
+	c.stateOpChan <- func() {
 		acceptedWorkerID := c.state.workerFiniteSet.numWorkers
 
 		acceptededWorker := worker{
@@ -137,11 +141,11 @@ func (c *Coordinator) AcceptWorker() acceptWorkerResp {
 
 		c.state.workerFiniteSet.numWorkers++
 
-		// Required: error cases
-		// Invariant: the number of max workers
-		// Retry:
+		acceptedProfile := WorkerProfile{
+			ID: acceptedWorkerID,
+		}
 
-		respChan <- acceptWorkerResp{id: acceptedWorkerID, err: nil}
+		respChan <- acceptWorkerResp{profile: acceptedProfile}
 	}
 
 	return <-respChan
@@ -151,50 +155,111 @@ func (c *Coordinator) AcceptWorker() acceptWorkerResp {
 // RPC server definitions for a coordinator. Separation of networking concerns.
 // ------------------------
 
-// CoordinatorRPC represents a RPC server. It is passed to the Go's built-in RPC package("net/rpc").
-type CoordinatorRPC struct {
+// CoordinatorServer is a single listener to handle both of general RPC requests and signaling concerns.
+// To separate side-concerns, signaling handlers are registered wrapped in another RPC object.
+type CoordinatorServer struct {
 	coord *Coordinator
+
+	signalHandler *SignalServer
+
+	rpcServer  *rpc.Server
+	httpServer *http.Server
+	listener   net.Listener
 }
 
-func (crpc *CoordinatorRPC) server() {
-	if err := rpc.Register(crpc); err != nil {
-		log.Fatalf("<FATAL> Failed to register RPC: %v\n", err)
+func (cs *CoordinatorServer) server() {
+
+	// Register RPC methods to an instance of RPC server.
+	rpcServer := rpc.NewServer()
+
+	if err := rpcServer.RegisterName("CoordinatorService", cs); err != nil {
+		log.Fatalf("<FATAL> Coordinator server thread: Failed to register coordinator server RPC methods: %v\n", err)
 	}
 
-	rpc.HandleHTTP()
+	if err := rpcServer.RegisterName("SingalService", cs.signalHandler); err != nil {
+		log.Fatalf("<FATAL> Coordinator server thread: Failed to register signal handler RPC methods: %v\n", err)
+	}
+
+	// Create a custom HTTP mux and mount the RPC server
+	mux := http.NewServeMux()
+	mux.Handle("/rpc", rpcServer) // all RPC requests go to /rpc
 
 	sockname := CoordinatorSock()
 	os.Remove(sockname)
-	l, err := net.Listen("unix", sockname)
-	if err != nil {
-		log.Fatalf("<FATAL> Failed to listen error: %v\n", err)
+	addr := sockname
+
+	// Create the HTTP server instance
+	httpServer := &http.Server{
+		Addr:    addr,
+		Handler: mux,
 	}
 
-	log.Printf("<INFO> Listens on: %s\n", sockname)
+	// Register the lister on a TCP port
+	l, err := net.Listen("unix", addr)
+	if err != nil {
+		log.Fatalf("<FATAL> Coordinator server thread: Failed to register listener: %v\n", err)
+	}
 
+	cs.rpcServer = rpcServer
+	cs.httpServer = httpServer
+	cs.listener = l
+
+	cs.Start()
+}
+
+func (cs *CoordinatorServer) Start() {
 	go func() {
-		if err := http.Serve(l, nil); err != nil {
-			log.Fatalf("<FATAL> HTTP server failed: %v\n", err)
+		log.Println("<INFO> Coordinator server thread: Running on", cs.listener.Addr())
+		if err := cs.httpServer.Serve(cs.listener); err != nil && err != http.ErrServerClosed {
+			// http.ErrServerClosed: This is not a real failure. This error is returned after http server is closed.
+			log.Fatalf("<FATAL> Coordinator server thread: Failed to run HTTP server: %v\n", err)
 		}
 	}()
 }
 
-func (crpc *CoordinatorRPC) Connect(args ConnectArgs, reply *ConnectReply) error {
+func (cs *CoordinatorServer) Stop() {
+	log.Println("<INFO> Coordinator server thread: Shutting down coordinator server...")
+	// *http.Server.Shutdown():
+	// 1. The server stops accepting new connections.
+	// 2. Idle connections are closed.
+	// 3. Active connections (requests in progress) are waited on until they finish.
 
-	resp := crpc.coord.AcceptWorker()
+	// Policies around context package:
+	// context.Background() → wait forever, no timeout, no cancel.
+	// context.WithTimeout() → wait up to X duration; if not finished, force-close.
+	// context.WithCancel() → can cancel early based on some signal.
 
-	if resp.err != nil {
-		// Required: error cases
-		// Invariant: the number of max workers
-		// Retry:
+	ctx := context.Background() // Truly-gracefull termination.
+
+	if err := cs.httpServer.Shutdown(ctx); err != nil {
+		log.Println("<INFO> Coordinator server thread: Shutdown error:", err)
+	} else {
+		log.Println("<INFO> Coordinantor server thread: HTTP/RPC server stopped.")
 	}
+}
+
+func (cs *CoordinatorServer) Connect(args ConnectArgs, reply *ConnectReply) error {
+
+	resp := cs.coord.AcceptWorker()
 
 	// reply
-	reply.Profile.ID = resp.id
+	reply.Profile = resp.profile
 
-	log.Printf("<INFO> Worker %d is initialized\n", resp.id)
+	log.Printf("<INFO> Coordinator RPC server thread: Worker %d is initialized\n", resp.profile.ID)
 
 	return nil
+}
+
+type SignalServer struct {
+	coord *Coordinator
+}
+
+// ------------------------
+// Worker scanner type definitions
+// ------------------------
+
+type workerScanner struct {
+	coord *Coordinator
 }
 
 // ------------------------
@@ -227,11 +292,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 				q: make([]*task, 0),
 			},
 		},
-		cmdChan: make(chan func(), 100),
-	}
-
-	cRPC := &CoordinatorRPC{
-		coord: &c,
+		stateOpChan: make(chan func(), 100),
 	}
 
 	for i := 0; i < c.state.taskFiniteSet.mapTasksToComplete; i++ {
@@ -265,11 +326,16 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		c.state.idleTaskQueue.q = append(c.state.idleTaskQueue.q, rt)
 	}
 
-	log.Println("<INFO> Initialized the coordinator")
+	c.coordinatorServer = &CoordinatorServer{
+		coord: &c,
+	}
+	c.workerScanner = &workerScanner{
+		coord: &c,
+	}
+
+	log.Println("<INFO> Main thread: Initialized")
 
 	go c.Run()
-
-	cRPC.server()
 
 	return &c
 }

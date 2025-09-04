@@ -306,7 +306,7 @@ func (el *executionLoop) connect() {
 	args := ConnectArgs{}
 	reply := ConnectReply{}
 
-	err := el.call(RPCConnect, &args, &reply)
+	err := el.call(CoordinatorConnect, &args, &reply)
 
 	if err != nil {
 		// Fault tolerance: Retry policy is required.
@@ -328,7 +328,7 @@ func (el *executionLoop) schedule() {
 	args := ScheduleArgs{}
 	reply := ScheduleReply{}
 
-	err := el.call(RPCSchedule, &args, &reply)
+	err := el.call(CoordinatorSchedule, &args, &reply)
 
 	if err != nil {
 		// Fault tolerance: Retry policy is required.
@@ -435,21 +435,15 @@ func MakeWorker(mapf mapFunc, reducef reduceFunc) {
 		stateOpChan: make(chan func(), 100),
 	}
 
-	wExecutionLoop := executionLoop{
+	w.executionLoop = &executionLoop{
 		w: &w,
 	}
-
-	wSignalHandler := signalHandler{
+	w.signalHandler = &signalHandler{
 		w: &w,
 	}
-
-	wShuffleServer := shuffleServer{
+	w.shuffleServer = &shuffleServer{
 		w: &w,
 	}
-
-	w.executionLoop = &wExecutionLoop
-	w.signalHandler = &wSignalHandler
-	w.shuffleServer = &wShuffleServer
 
 	log.Println("<INFO> Main thread: Initialized")
 

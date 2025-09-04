@@ -11,8 +11,12 @@ import (
 // ------------------------
 
 const (
-	RPCConnect  = "CoordinatorRPC.Connect"
-	RPCSchedule = "CoordinatorRPC.Schedule"
+	CoordinatorConnect  = "CoordinatorService.Connect"
+	CoordinatorSchedule = "CoordinatorService.Schedule"
+)
+
+const (
+	SignalAction = "SignalService.Action" // An example of signal service method name.
 )
 
 // ------------------------
