@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"time"
 )
 
 // ------------------------
@@ -106,17 +107,55 @@ type Coordinator struct {
 
 	coordinatorServer *CoordinatorServer
 	workerScanner     *workerScanner
+
+	barrierWithParent   *ThreadLifecycleBarrier
+	barrierWithChildren *ThreadLifecycleBarrier
 }
 
 func (c *Coordinator) Run() {
+	defer c.barrierWithParent.DoneSig()
+
+	log.Println("<INFO> State manager: Intialized")
+
+	c.barrierWithParent.ReadySig()
+
+	c.barrierWithChildren = NewThreadLifeCycleBarrier(2)
+
+	c.coordinatorServer.barrierWithParent = c.barrierWithChildren
+	c.workerScanner.barrierWithParent = c.barrierWithChildren
+
+	go c.coordinatorServer.run()
+	go c.workerScanner.run()
+
+	c.barrierWithChildren.Ready()
+
+	log.Println("<INFO> Stage manager: Synchronized with children: Coordinator server, Worker scanner")
+
+	// Simulate a termination of state manager thread for testing a graceful termination.
+	go func() {
+		time.Sleep(time.Second * 10)
+		c.Terminate()
+	}()
+
 	for stateOp := range c.stateOpChan {
 		stateOp()
 	}
+
+	c.barrierWithChildren.Done()
+
+	log.Println("<INFO> State manager: Terminated")
 }
 
-func (c *Coordinator) Done() bool {
-	ret := false
-	return ret
+func (c *Coordinator) Terminate() {
+	c.stateOpChan <- func() {
+
+		c.coordinatorServer.stop()
+		c.workerScanner.quitWorkerScanner()
+
+		c.barrierWithChildren.Done()
+
+		close(c.stateOpChan)
+	}
 }
 
 type acceptWorkerResp struct {
@@ -165,6 +204,22 @@ type CoordinatorServer struct {
 	rpcServer  *rpc.Server
 	httpServer *http.Server
 	listener   net.Listener
+
+	barrierWithParent *ThreadLifecycleBarrier
+}
+
+func (cs *CoordinatorServer) run() {
+	defer cs.barrierWithParent.DoneSig()
+
+	cs.server()
+
+	log.Println("<INFO> Coordinator server: Intialized")
+
+	cs.barrierWithParent.ReadySig()
+
+	cs.start()
+
+	log.Println("<INFO> Coordinator server: Terminated")
 }
 
 func (cs *CoordinatorServer) server() {
@@ -173,11 +228,11 @@ func (cs *CoordinatorServer) server() {
 	rpcServer := rpc.NewServer()
 
 	if err := rpcServer.RegisterName("CoordinatorService", cs); err != nil {
-		log.Fatalf("<FATAL> Coordinator server thread: Failed to register coordinator server RPC methods: %v\n", err)
+		log.Fatalf("<FATAL> Coordinator server: Failed to register coordinator server RPC methods / %v\n", err)
 	}
 
 	if err := rpcServer.RegisterName("SingalService", cs.signalHandler); err != nil {
-		log.Fatalf("<FATAL> Coordinator server thread: Failed to register signal handler RPC methods: %v\n", err)
+		log.Fatalf("<FATAL> Coordinator server: Failed to register signal handler RPC methods / %v\n", err)
 	}
 
 	// Create a custom HTTP mux and mount the RPC server
@@ -197,28 +252,26 @@ func (cs *CoordinatorServer) server() {
 	// Register the lister on a TCP port
 	l, err := net.Listen("unix", addr)
 	if err != nil {
-		log.Fatalf("<FATAL> Coordinator server thread: Failed to register listener: %v\n", err)
+		log.Fatalf("<FATAL> Coordinator server: Failed to register listener / %v\n", err)
 	}
 
 	cs.rpcServer = rpcServer
 	cs.httpServer = httpServer
 	cs.listener = l
-
-	cs.Start()
 }
 
-func (cs *CoordinatorServer) Start() {
-	go func() {
-		log.Println("<INFO> Coordinator server thread: Running on", cs.listener.Addr())
-		if err := cs.httpServer.Serve(cs.listener); err != nil && err != http.ErrServerClosed {
-			// http.ErrServerClosed: This is not a real failure. This error is returned after http server is closed.
-			log.Fatalf("<FATAL> Coordinator server thread: Failed to run HTTP server: %v\n", err)
-		}
-	}()
+func (cs *CoordinatorServer) start() {
+
+	log.Println("<INFO> Coordinator server: Running on", cs.listener.Addr())
+	if err := cs.httpServer.Serve(cs.listener); err != nil && err != http.ErrServerClosed {
+		// http.ErrServerClosed: This is not a real failure. This error is returned after http server is closed.
+		log.Fatalf("<FATAL> Coordinator server: Failed to run HTTP server / %v\n", err)
+	}
+
 }
 
-func (cs *CoordinatorServer) Stop() {
-	log.Println("<INFO> Coordinator server thread: Shutting down coordinator server...")
+func (cs *CoordinatorServer) stop() {
+	log.Println("<INFO> Coordinator server: Shutting down coordinator server...")
 	// *http.Server.Shutdown():
 	// 1. The server stops accepting new connections.
 	// 2. Idle connections are closed.
@@ -232,9 +285,9 @@ func (cs *CoordinatorServer) Stop() {
 	ctx := context.Background() // Truly-gracefull termination.
 
 	if err := cs.httpServer.Shutdown(ctx); err != nil {
-		log.Println("<INFO> Coordinator server thread: Shutdown error:", err)
+		log.Println("<INFO> Coordinator server: Shutdown error / ", err)
 	} else {
-		log.Println("<INFO> Coordinantor server thread: HTTP/RPC server stopped.")
+		log.Println("<INFO> Coordinator server: Shutdown Successfully")
 	}
 }
 
@@ -245,7 +298,7 @@ func (cs *CoordinatorServer) Connect(args ConnectArgs, reply *ConnectReply) erro
 	// reply
 	reply.Profile = resp.profile
 
-	log.Printf("<INFO> Coordinator RPC server thread: Worker %d is initialized\n", resp.profile.ID)
+	log.Printf("<INFO> Coordinator RPC server: Worker %d is initialized\n", resp.profile.ID)
 
 	return nil
 }
@@ -254,12 +307,39 @@ type SignalServer struct {
 	coord *Coordinator
 }
 
+// Action ... => for testing
+func (ss *SignalServer) Action(args ActionArgs, reply *ActionReply) error {
+	return nil
+}
+
 // ------------------------
 // Worker scanner type definitions
 // ------------------------
 
 type workerScanner struct {
 	coord *Coordinator
+
+	isTerminated bool // For testing a graceful termination
+
+	barrierWithParent *ThreadLifecycleBarrier
+}
+
+func (ws *workerScanner) run() {
+	defer ws.barrierWithParent.DoneSig()
+
+	log.Println("<INFO> Worker scanner: Intialized")
+
+	ws.barrierWithParent.ReadySig()
+
+	for !ws.isTerminated {
+		time.Sleep(time.Second * 10)
+	}
+
+	log.Println("<INFO> Worker scanner: Terminated")
+}
+
+func (ws *workerScanner) quitWorkerScanner() {
+	ws.isTerminated = true
 }
 
 // ------------------------
@@ -267,7 +347,7 @@ type workerScanner struct {
 // ------------------------
 
 // MakeCoordinator initializes data structures for internal service state. This is the actual entry point of the coordinator process.
-func MakeCoordinator(files []string, nReduce int) *Coordinator {
+func MakeCoordinator(files []string, nReduce int) {
 	// Logger initialization
 	prefix := fmt.Sprintf("[ COORDINATOR | PID: %d ] ", os.Getpid())
 	log.SetOutput(os.Stdout)
@@ -328,14 +408,27 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	c.coordinatorServer = &CoordinatorServer{
 		coord: &c,
+
+		signalHandler: &SignalServer{
+			coord: &c,
+		},
 	}
 	c.workerScanner = &workerScanner{
 		coord: &c,
 	}
 
-	log.Println("<INFO> Main thread: Initialized")
+	log.Println("<INFO> Main: Initialized")
+	b := NewThreadLifeCycleBarrier(1)
+
+	c.barrierWithParent = b
 
 	go c.Run()
 
-	return &c
+	b.Ready()
+
+	log.Println("<INFO> Main: Synchronized with children: State manager")
+
+	b.Done()
+
+	log.Println("<INFO> Main: Terminated")
 }

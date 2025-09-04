@@ -16,11 +16,12 @@ const (
 )
 
 const (
-	SignalAction = "SignalService.Action" // An example of signal service method name.
+	// An example of signal service method name.
+	SignalAction = "SignalService.Action"
 )
 
 // ------------------------
-// Args and reply type definitions for RPC methods
+// Args and reply type definitions for general RPC methods
 // ------------------------
 
 // ConnectArgs is an argument type of RPC method "CoordinatorRPC.Connect"
@@ -40,6 +41,16 @@ type ScheduleArgs struct {
 type ScheduleReply struct {
 	Task Job
 }
+
+// ------------------------
+// Args and reply type definitions for signaling
+// ------------------------
+
+// ActionArgs ...
+type ActionArgs struct{}
+
+// ActionReply ...
+type ActionReply struct{}
 
 func CoordinatorSock() string {
 	s := "/var/tmp/5840-mr-"

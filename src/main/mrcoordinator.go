@@ -12,7 +12,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/jeffbukk00/mapreduce/src/mr"
 )
@@ -23,10 +22,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	m := mr.MakeCoordinator(os.Args[1:], 10)
-	for m.Done() == false {
-		time.Sleep(time.Second)
-	}
-
-	time.Sleep(time.Second)
+	mr.MakeCoordinator(os.Args[1:], 10)
 }

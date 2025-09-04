@@ -132,35 +132,34 @@ type Worker struct {
 func (w *Worker) Run() {
 	defer w.barrierWithParent.DoneSig()
 
-	log.Println("<INFO> State manager thread: Intialized")
+	log.Println("<INFO> State manager: Intialized")
 
 	w.barrierWithParent.ReadySig()
 
 	// Lifecycle synchronization barrier:
 	// Parent thread: State manager thread
 	// Child thread: Execution loop thread, Signal handler thread, Shuffle server thread
-	b := NewThreadLifeCycleBarrier(3)
-	w.barrierWithChildren = b
+	w.barrierWithChildren = NewThreadLifeCycleBarrier(3)
 
-	w.executionLoop.barrierWithParent = b
-	w.signalHandler.barrierWithParent = b
-	w.shuffleServer.barrierWithParent = b
+	w.executionLoop.barrierWithParent = w.barrierWithChildren
+	w.signalHandler.barrierWithParent = w.barrierWithChildren
+	w.shuffleServer.barrierWithParent = w.barrierWithChildren
 
 	go w.executionLoop.run()
 	go w.signalHandler.run()
 	go w.shuffleServer.run()
 
-	b.Ready()
+	w.barrierWithChildren.Ready()
 
-	log.Println("<INFO> Stage manager thread: Synchronized with child threads: Execution loop thread, Signal handler thread, Shuffle server thread")
+	log.Println("<INFO> Stage manager: Synchronized with children: Execution loop, Signal handler, Shuffle server")
 
 	for stateOp := range w.stateOpChan {
 		stateOp()
 	}
 
-	b.Done()
+	w.barrierWithChildren.Done()
 
-	log.Println("<INFO> State manager thread: Terminated")
+	log.Println("<INFO> State manager: Terminated")
 }
 
 func (w *Worker) Terminate() {
@@ -240,13 +239,13 @@ func (el *executionLoop) run() {
 	// It prevents for the state manager thread from being blocked
 	el.stageChan = make(chan executionStage, 10)
 
-	log.Println("<INFO> Execution Loop thread: Intialized")
+	log.Println("<INFO> Execution Loop: Intialized")
 
 	el.barrierWithParent.ReadySig()
 
 	el.startLoop()
 
-	log.Println("<INFO> Execution loop thread: Terminated")
+	log.Println("<INFO> Execution loop: Terminated")
 }
 
 func (el *executionLoop) call(rpcname string, args interface{}, reply interface{}) error {
@@ -254,7 +253,7 @@ func (el *executionLoop) call(rpcname string, args interface{}, reply interface{
 	sockname := CoordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("<FATAL> Execution loop thread: Connect to the coordinator: ", err)
+		log.Fatal("<FATAL> Execution loop: Connect to the coordinator: ", err)
 	}
 	defer c.Close() // Open and close a TCP connection per a RPC request.
 
@@ -265,7 +264,7 @@ func (el *executionLoop) call(rpcname string, args interface{}, reply interface{
 
 func (el *executionLoop) startLoop() {
 
-	log.Println("<INFO> Execution loop thread: Start to loop")
+	log.Println("<INFO> Execution loop: Start to loop")
 
 	var e executionStage
 
@@ -278,27 +277,27 @@ func (el *executionLoop) startLoop() {
 
 		switch e {
 		case StageConnect:
-			log.Println("<INFO> Execution loop thread: Is at the Connect stage")
+			log.Println("<INFO> Execution loop: Is at the Connect stage")
 			el.connect()
 		case StageSchedule:
-			log.Println("<INFO> Execution loop thread: Is at the Schedule stage")
+			log.Println("<INFO> Execution loop: Is at the Schedule stage")
 			el.schedule()
 		case StageFetchInput:
-			log.Println("<INFO> Execution loop thread: Is at the FetchInput stage")
+			log.Println("<INFO> Execution loop: Is at the FetchInput stage")
 			el.fetchInput()
 		case StageProgressTask:
-			log.Println("<INFO> Execution loop thread: Is at the ProgressTask stage")
+			log.Println("<INFO> Execution loop: Is at the ProgressTask stage")
 			el.processTask()
 		case StageCommitOutput:
-			log.Println("<INFO> Execution loop thread: Is at the CommitOutput stage")
+			log.Println("<INFO> Execution loop: Is at the CommitOutput stage")
 			el.commitOutput()
 		case StageTerminateLoop:
-			log.Println("<INFO> Execution loop thread: Is at the TerminateLoop stage")
+			log.Println("<INFO> Execution loop: Is at the TerminateLoop stage")
 			el.isTerminated = true // Propagate a termination.
 		}
 	}
 
-	log.Println("<INFO> Execution loop thread: Stop to loop")
+	log.Println("<INFO> Execution loop: Stop to loop")
 }
 
 func (el *executionLoop) connect() {
@@ -310,7 +309,7 @@ func (el *executionLoop) connect() {
 
 	if err != nil {
 		// Fault tolerance: Retry policy is required.
-		log.Println("<ERROR> Execution loop thread: Failed to connect to the coordinator")
+		log.Println("<ERROR> Execution loop: Failed to connect to the coordinator")
 		return
 	}
 
@@ -319,7 +318,7 @@ func (el *executionLoop) connect() {
 	// Update the global logger with assigned worker id.
 	prefix := fmt.Sprintf("[ WORKER | PID: %d | ID: %d ] ", os.Getpid(), reply.Profile.ID)
 	log.SetPrefix(prefix)
-	log.Printf("<INFO> Execution loop thread: Worker %d is Connected", reply.Profile.ID)
+	log.Printf("<INFO> Execution loop: Worker %d is Connected", reply.Profile.ID)
 
 	el.stageChan <- StageSchedule
 }
@@ -332,7 +331,7 @@ func (el *executionLoop) schedule() {
 
 	if err != nil {
 		// Fault tolerance: Retry policy is required.
-		log.Println("<ERROR> Execution loop thread: Failed to schedule")
+		log.Println("<ERROR> Execution loop: Failed to schedule")
 		return
 	}
 
@@ -371,13 +370,13 @@ type signalHandler struct {
 func (sh *signalHandler) run() {
 	defer sh.barrierWithParent.DoneSig()
 
-	log.Println("<INFO> Signal handler thread: Intialized")
+	log.Println("<INFO> Signal handler: Intialized")
 
 	sh.barrierWithParent.ReadySig()
 
 	sh.notifyTerminationToStateManager()
 
-	log.Println("<INFO> Signal handler thread: Terminated")
+	log.Println("<INFO> Signal handler: Terminated")
 
 }
 
@@ -400,13 +399,13 @@ type shuffleServer struct {
 func (ss *shuffleServer) run() {
 	defer ss.barrierWithParent.DoneSig()
 
-	log.Println("<INFO> Shuffle server thread: Intialized")
+	log.Println("<INFO> Shuffle server: Intialized")
 
 	ss.barrierWithParent.ReadySig()
 
 	time.Sleep(time.Second * 5)
 
-	log.Println("<INFO> Shuffle server thread: Terminated")
+	log.Println("<INFO> Shuffle server: Terminated")
 }
 
 func (ss *shuffleServer) quitShuffleServer() {}
@@ -445,7 +444,7 @@ func MakeWorker(mapf mapFunc, reducef reduceFunc) {
 		w: &w,
 	}
 
-	log.Println("<INFO> Main thread: Initialized")
+	log.Println("<INFO> Main: Initialized")
 
 	// Lifecycle synchronization barrier
 	// Parent thread: Main thread
@@ -458,11 +457,11 @@ func MakeWorker(mapf mapFunc, reducef reduceFunc) {
 
 	b.Ready()
 
-	log.Println("<INFO> Main thread: Synchronized with child threads: State manager thread")
+	log.Println("<INFO> Main: Synchronized with children: State manager")
 
 	b.Done()
 
-	log.Println("<INFO> Main thread: Main thread: Terminated")
+	log.Println("<INFO> Main thread: Terminated")
 }
 
 // ------------------------
