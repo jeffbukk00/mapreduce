@@ -131,12 +131,6 @@ func (c *Coordinator) Run() {
 
 	log.Println("<INFO> Stage manager: Synchronized with children: Coordinator server, Worker scanner")
 
-	// Simulate a termination of state manager thread for testing a graceful termination.
-	go func() {
-		time.Sleep(time.Second * 10)
-		c.Terminate()
-	}()
-
 	for stateOp := range c.stateOpChan {
 		stateOp()
 	}
@@ -199,7 +193,7 @@ func (c *Coordinator) AcceptWorker() acceptWorkerResp {
 type CoordinatorServer struct {
 	coord *Coordinator
 
-	signalHandler *SignalServer
+	signalServer *SignalServer
 
 	rpcServer  *rpc.Server
 	httpServer *http.Server
@@ -214,7 +208,7 @@ func (cs *CoordinatorServer) run() {
 	cs.server()
 
 	log.Println("<INFO> Coordinator server: Intialized")
-
+	cs.signalServer.pingCount = 4
 	cs.barrierWithParent.ReadySig()
 
 	cs.start()
@@ -227,12 +221,12 @@ func (cs *CoordinatorServer) server() {
 	// Register RPC methods to an instance of RPC server.
 	rpcServer := rpc.NewServer()
 
-	if err := rpcServer.RegisterName("CoordinatorService", cs); err != nil {
+	if err := rpcServer.RegisterName(CoordinatorService, cs); err != nil {
 		log.Fatalf("<FATAL> Coordinator server: Failed to register coordinator server RPC methods / %v\n", err)
 	}
 
-	if err := rpcServer.RegisterName("SingalService", cs.signalHandler); err != nil {
-		log.Fatalf("<FATAL> Coordinator server: Failed to register signal handler RPC methods / %v\n", err)
+	if err := rpcServer.RegisterName(SignalService, cs.signalServer); err != nil {
+		log.Fatalf("<FATAL> Coordinator server: Failed to register signal Server RPC methods / %v\n", err)
 	}
 
 	// Create a custom HTTP mux and mount the RPC server
@@ -298,17 +292,39 @@ func (cs *CoordinatorServer) Connect(args ConnectArgs, reply *ConnectReply) erro
 	// reply
 	reply.Profile = resp.profile
 
-	log.Printf("<INFO> Coordinator RPC server: Worker %d is initialized\n", resp.profile.ID)
+	log.Printf("<INFO> Coordinator server: Worker %d is initialized\n", resp.profile.ID)
 
 	return nil
 }
 
 type SignalServer struct {
 	coord *Coordinator
+
+	pingCount int
 }
 
-// Action ... => for testing
-func (ss *SignalServer) Action(args ActionArgs, reply *ActionReply) error {
+type PingResponseType int
+
+const (
+	None = iota
+	AllTasksCompleted
+)
+
+type PingResponse struct {
+	RespType PingResponseType
+}
+
+func (ss *SignalServer) Ping(args PingArgs, reply *PingReply) error {
+	log.Printf("<INFO> Signal server: Got a ping from the worker %d\n", args.WorkerID)
+	ss.pingCount--
+
+	if ss.pingCount <= 0 {
+		reply.Resp.RespType = AllTasksCompleted
+		return nil
+	}
+
+	reply.Resp.RespType = None
+
 	return nil
 }
 
@@ -409,7 +425,7 @@ func MakeCoordinator(files []string, nReduce int) {
 	c.coordinatorServer = &CoordinatorServer{
 		coord: &c,
 
-		signalHandler: &SignalServer{
+		signalServer: &SignalServer{
 			coord: &c,
 		},
 	}

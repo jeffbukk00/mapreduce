@@ -107,10 +107,20 @@ type WorkerProfile struct {
 
 type workerState struct {
 	profile    WorkerProfile
+	stage      executionStage
 	currentJob Job
 	mapf       mapFunc
 	reducef    reduceFunc
 }
+
+/*
+	Worker(State Manager)
+
+	<MUST NOT>
+	1) Warn: Don't being blocked => all serialized ops on the shared state => could be stalled
+	2) Fatal: Don't being blocked by sub-threads => could be deadlock
+
+*/
 
 // Worker owns the shared state.
 // No other threads can access or modify the shared state directly.
@@ -165,6 +175,8 @@ func (w *Worker) Run() {
 func (w *Worker) Terminate() {
 
 	w.stateOpChan <- func() {
+		log.Println("<INFO> State manager: Try to terminate all sub-threads")
+
 		w.executionLoop.quitLoop()
 		w.signalHandler.quitSignalHandler()
 		w.shuffleServer.quitShuffleServer()
@@ -175,6 +187,53 @@ func (w *Worker) Terminate() {
 	}
 
 	// No synchronization with the caller.
+}
+
+type getExecutionStageResp struct {
+	currentStage executionStage
+}
+
+func (w *Worker) GetExecutionStage() getExecutionStageResp {
+	resp := make(chan getExecutionStageResp)
+
+	w.stateOpChan <- func() {
+		resp <- getExecutionStageResp{currentStage: w.state.stage}
+	}
+
+	return <-resp
+}
+
+type updateExecutionStageReq struct {
+	updatedStage executionStage
+}
+
+func (w *Worker) UpdateExecutionStage(req updateExecutionStageReq) {
+	done := make(chan struct{})
+
+	w.stateOpChan <- func() {
+		w.state.stage = req.updatedStage
+
+		done <- struct{}{}
+	}
+
+	<-done
+
+}
+
+type getWorkerProfileResp struct {
+	profile WorkerProfile
+}
+
+func (w *Worker) GetWorkerProfile() getWorkerProfileResp {
+	resp := make(chan getWorkerProfileResp)
+
+	w.stateOpChan <- func() {
+
+		resp <- getWorkerProfileResp{profile: w.state.profile}
+
+	}
+
+	return <-resp
 }
 
 type assignWorkerProfileReq struct {
@@ -194,6 +253,30 @@ func (w *Worker) AssignWorkerProfile(req assignWorkerProfileReq) {
 	}
 
 	<-done
+}
+
+type getJobResp struct {
+	currentJob Job
+}
+
+func (w *Worker) GetJob() getJobResp {
+	resp := make(chan getJobResp)
+
+	w.stateOpChan <- func() {
+		currentJob := Job{}
+		currentJob.Class = w.state.currentJob.Class
+		currentJob.Seq = w.state.currentJob.Seq
+
+		currentJob.InputPath = make([]string, len(w.state.currentJob.InputPath)) // Deep copying
+
+		currentJob.RequiredInputs = w.state.currentJob.RequiredInputs
+
+		resp <- getJobResp{
+			currentJob: currentJob,
+		}
+	}
+
+	return <-resp
 }
 
 type assignJobReq struct {
@@ -221,8 +304,7 @@ func (w *Worker) AssignJob(req assignJobReq) {
 
 // ExecutionLoop loops a sequence of execution stages in strict order.
 type executionLoop struct {
-	stage        executionStage
-	isTerminated bool
+	stage executionStage
 
 	stageChan chan executionStage
 
@@ -251,9 +333,9 @@ func (el *executionLoop) run() {
 func (el *executionLoop) call(rpcname string, args interface{}, reply interface{}) error {
 
 	sockname := CoordinatorSock()
-	c, err := rpc.DialHTTP("unix", sockname)
+	c, err := rpc.DialHTTPPath("unix", sockname, "/rpc")
 	if err != nil {
-		log.Fatal("<FATAL> Execution loop: Connect to the coordinator: ", err)
+		log.Fatal("<FATAL> Execution loop: Failed to connect to the coordinator: ", err)
 	}
 	defer c.Close() // Open and close a TCP connection per a RPC request.
 
@@ -270,30 +352,34 @@ func (el *executionLoop) startLoop() {
 
 	el.stageChan <- StageConnect
 
-	for !el.isTerminated {
-		e = <-el.stageChan
+	for e = range el.stageChan {
 
 		el.stage = e
 
 		switch e {
 		case StageConnect:
+			el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageConnect})
 			log.Println("<INFO> Execution loop: Is at the Connect stage")
 			el.connect()
 		case StageSchedule:
+			el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageSchedule})
 			log.Println("<INFO> Execution loop: Is at the Schedule stage")
 			el.schedule()
 		case StageFetchInput:
+			el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageFetchInput})
 			log.Println("<INFO> Execution loop: Is at the FetchInput stage")
 			el.fetchInput()
 		case StageProgressTask:
+			el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageProgressTask})
 			log.Println("<INFO> Execution loop: Is at the ProgressTask stage")
 			el.processTask()
 		case StageCommitOutput:
+			el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageSchedule})
 			log.Println("<INFO> Execution loop: Is at the CommitOutput stage")
 			el.commitOutput()
 		case StageTerminateLoop:
 			log.Println("<INFO> Execution loop: Is at the TerminateLoop stage")
-			el.isTerminated = true // Propagate a termination.
+			close(el.stageChan) // Propagate a termination.
 		}
 	}
 
@@ -321,6 +407,7 @@ func (el *executionLoop) connect() {
 	log.Printf("<INFO> Execution loop: Worker %d is Connected", reply.Profile.ID)
 
 	el.stageChan <- StageSchedule
+
 }
 
 func (el *executionLoop) schedule() {
@@ -338,24 +425,29 @@ func (el *executionLoop) schedule() {
 	el.w.AssignJob(assignJobReq{job: reply.Task})
 
 	el.stageChan <- StageFetchInput
+
 }
 
 func (el *executionLoop) fetchInput() {
 	el.stageChan <- StageProgressTask
+
 }
 
 func (el *executionLoop) processTask() {
 	el.stageChan <- StageCommitOutput
+	el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageCommitOutput})
 }
 
 func (el *executionLoop) commitOutput() {
 
 	el.stageChan <- StageSchedule // Loop. Return to StageSchedule.
+
 }
 
 func (el *executionLoop) quitLoop() {
 	// Notified by the signal handler.
 	el.stageChan <- StageTerminateLoop
+
 }
 
 // ------------------------
@@ -364,27 +456,132 @@ func (el *executionLoop) quitLoop() {
 type signalHandler struct {
 	w *Worker
 
+	pingRespChan chan PingResponse
+
+	pingRespLoopDone   chan struct{}
+	pingSenderLoopDone chan struct{}
+
+	connectionToSignal *rpc.Client // This is bidirectional, persistent TCP(HTTP) connection.
+
 	barrierWithParent *ThreadLifecycleBarrier
 }
 
 func (sh *signalHandler) run() {
 	defer sh.barrierWithParent.DoneSig()
 
+	sh.pingRespChan = make(chan PingResponse)
+	sh.pingRespLoopDone = make(chan struct{})
+	sh.pingSenderLoopDone = make(chan struct{})
+
 	log.Println("<INFO> Signal handler: Intialized")
 
 	sh.barrierWithParent.ReadySig()
 
-	sh.notifyTerminationToStateManager()
+	sh.initializeConnection()
+
+	// Close the connection for signaling when signal handler itself is terminated.
+	defer sh.connectionToSignal.Close()
+
+	go sh.runPingSender()
+	sh.runPingRespHandler()
 
 	log.Println("<INFO> Signal handler: Terminated")
 
 }
 
-func (sh *signalHandler) quitSignalHandler() {}
+func (sh *signalHandler) initializeConnection() {
+	sockname := CoordinatorSock()
+	c, err := rpc.DialHTTPPath("unix", sockname, "/rpc")
+	if err != nil {
+		log.Fatal("<FATAL> Signal handler: Failed to connect to the coordinator: ", err)
+	}
+	sh.connectionToSignal = c
+}
+
+func (sh *signalHandler) call(rpcname string, args interface{}, reply interface{}) error {
+	c := sh.connectionToSignal
+
+	err := c.Call(rpcname, args, reply)
+
+	return err
+}
+
+func (sh *signalHandler) runPingSender() {
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			isSent := sh.sendPing()
+			if !isSent {
+				time.Sleep(3 * time.Second) // Back-off sending a ping if worker profile is not assigned yet.
+			}
+		case <-sh.pingSenderLoopDone:
+			log.Println("<INFO> Signal handler: Quit the ping sender loop")
+			return
+		}
+	}
+
+}
+
+func (sh *signalHandler) runPingRespHandler() {
+
+	for {
+		select {
+		case resp := <-sh.pingRespChan:
+			switch resp.RespType {
+			case None:
+				log.Println("<INFO> Signal handler: Got a ping response without any notification")
+			case AllTasksCompleted:
+				log.Println("<INFO> Signal handler: Got a notification AllTasksCompleted from the coordinator")
+				sh.notifyTerminationToStateManager()
+			default:
+				log.Println("<Error> Signal handler: Got a notification with unknown type")
+			}
+		case <-sh.pingRespLoopDone:
+			log.Println("<INFO> Signal handler: Quit the ping response loop")
+			return
+		}
+	}
+
+}
+
+func (sh *signalHandler) sendPing() bool {
+
+	if sh.w.GetExecutionStage().currentStage == StageConnect {
+		log.Println("<ERROR> Signal handler: Cannot send a ping if worker profile is not assigned from the coordinator yet.")
+		return false
+	}
+
+	args := PingArgs{}
+	reply := PingReply{}
+
+	args.WorkerID = sh.w.GetWorkerProfile().profile.ID
+
+	log.Println("<INFO> Signal handler: Try to send a ping to the coordinator")
+
+	err := sh.call(SignalPing, args, &reply)
+
+	if err != nil {
+		log.Printf("<ERROR> Signal handler: Failed to send a ping to the coordinator / %v", err)
+		return false
+	}
+
+	sh.pingRespChan <- reply.Resp
+
+	return true
+}
+
+func (sh *signalHandler) quitSignalHandler() {
+	log.Println("<INFO> Signal handler: Try to quit the signal handler")
+	sh.pingRespLoopDone <- struct{}{}
+	sh.pingSenderLoopDone <- struct{}{}
+}
 
 func (sh *signalHandler) notifyTerminationToStateManager() {
-	time.Sleep(time.Second * 20)
-	sh.w.Terminate()
+	sh.w.Terminate() // Notify to the state manger to start a graceful termination.
 }
 
 // ------------------------
@@ -392,6 +589,8 @@ func (sh *signalHandler) notifyTerminationToStateManager() {
 // ------------------------
 type shuffleServer struct {
 	w *Worker
+
+	isTerminated bool
 
 	barrierWithParent *ThreadLifecycleBarrier
 }
@@ -403,12 +602,17 @@ func (ss *shuffleServer) run() {
 
 	ss.barrierWithParent.ReadySig()
 
-	time.Sleep(time.Second * 5)
+	for !ss.isTerminated {
+
+		time.Sleep(time.Second * 5)
+	}
 
 	log.Println("<INFO> Shuffle server: Terminated")
 }
 
-func (ss *shuffleServer) quitShuffleServer() {}
+func (ss *shuffleServer) quitShuffleServer() {
+	ss.isTerminated = true
+}
 
 // ------------------------
 // Initialization of a worker process

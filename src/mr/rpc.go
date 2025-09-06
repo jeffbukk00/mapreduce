@@ -9,6 +9,10 @@ import (
 // RPC method name constants
 // Used to avoid hard-coded strings
 // ------------------------
+const (
+	CoordinatorService = "CoordinatorService"
+	SignalService      = "SignalService"
+)
 
 const (
 	CoordinatorConnect  = "CoordinatorService.Connect"
@@ -17,27 +21,27 @@ const (
 
 const (
 	// An example of signal service method name.
-	SignalAction = "SignalService.Action"
+	SignalPing = "SignalService.Ping"
 )
 
 // ------------------------
 // Args and reply type definitions for general RPC methods
 // ------------------------
 
-// ConnectArgs is an argument type of RPC method "CoordinatorRPC.Connect"
+// ConnectArgs is an argument type of RPC method "CoordinatorService.Connect"
 type ConnectArgs struct{}
 
-// ConnectReply is an return type of RPC method "CoordinatorRPC.Connect"
+// ConnectReply is an return type of RPC method "CoordinatorService.Connect"
 type ConnectReply struct {
 	Profile WorkerProfile
 }
 
-// ScheduleArgs is an argument type of RPC method "CoordinatorRPC.Connect"
+// ScheduleArgs is an argument type of RPC method "CoordinatorService.Connect"
 type ScheduleArgs struct {
 	WorkerID int
 }
 
-// ScheduleReply is an return type of RPC method "CoordinatorRPC.Connect"
+// ScheduleReply is an return type of RPC method "CoordinatorService.Connect"
 type ScheduleReply struct {
 	Task Job
 }
@@ -46,11 +50,15 @@ type ScheduleReply struct {
 // Args and reply type definitions for signaling
 // ------------------------
 
-// ActionArgs ...
-type ActionArgs struct{}
+// PingArgs is an argument type of RPC method "SignalService.Ping"
+type PingArgs struct {
+	WorkerID int
+}
 
-// ActionReply ...
-type ActionReply struct{}
+// PingReply is an return type of RPC method "SignalService.Ping"
+type PingReply struct {
+	Resp PingResponse
+}
 
 func CoordinatorSock() string {
 	s := "/var/tmp/5840-mr-"
