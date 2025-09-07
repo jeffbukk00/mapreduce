@@ -90,10 +90,9 @@ type reduceFunc func(string, []string) string
 // Job represent the state of currently progressing task in the worker.
 // It is scheduled by the coorinator.
 type Job struct {
-	Class          TaskClass
-	Seq            int
-	InputPath      []string
-	RequiredInputs int
+	Class     TaskClass
+	Seq       int
+	InputPath []string
 }
 
 // ------------------------
@@ -102,7 +101,8 @@ type Job struct {
 
 // WorkerProfile represents worker metatdata assigned by the coordinator.
 type WorkerProfile struct {
-	ID int
+	IsAssigned bool
+	ID         int
 }
 
 type workerState struct {
@@ -175,15 +175,17 @@ func (w *Worker) Run() {
 func (w *Worker) Terminate() {
 
 	w.stateOpChan <- func() {
-		log.Println("<INFO> State manager: Try to terminate all sub-threads")
+		go func() {
+			log.Println("<INFO> State manager: Try to terminate all sub-threads")
 
-		w.executionLoop.quitLoop()
-		w.signalHandler.quitSignalHandler()
-		w.shuffleServer.quitShuffleServer()
+			go w.executionLoop.quitLoop()
+			go w.signalHandler.quitSignalHandler()
+			go w.shuffleServer.quitShuffleServer()
 
-		w.barrierWithChildren.Done()
+			w.barrierWithChildren.Done()
 
-		close(w.stateOpChan)
+			close(w.stateOpChan)
+		}()
 	}
 
 	// No synchronization with the caller.
@@ -245,8 +247,6 @@ func (w *Worker) AssignWorkerProfile(req assignWorkerProfileReq) {
 
 	w.stateOpChan <- func() {
 
-		// Warning: This is a shallow copy.
-		// But, there is a guarantee of no shared references.
 		w.state.profile = req.profile
 
 		close(done)
@@ -268,8 +268,6 @@ func (w *Worker) GetJob() getJobResp {
 		currentJob.Seq = w.state.currentJob.Seq
 
 		currentJob.InputPath = make([]string, len(w.state.currentJob.InputPath)) // Deep copying
-
-		currentJob.RequiredInputs = w.state.currentJob.RequiredInputs
 
 		resp <- getJobResp{
 			currentJob: currentJob,
@@ -463,7 +461,10 @@ type signalHandler struct {
 
 	connectionToSignal *rpc.Client // This is bidirectional, persistent TCP(HTTP) connection.
 
-	barrierWithParent *ThreadLifecycleBarrier
+	isNotifiedWorkerDead bool
+
+	barrierWithParent   *ThreadLifecycleBarrier
+	barrierWithChildren *ThreadLifecycleBarrier
 }
 
 func (sh *signalHandler) run() {
@@ -475,15 +476,21 @@ func (sh *signalHandler) run() {
 
 	log.Println("<INFO> Signal handler: Intialized")
 
-	sh.barrierWithParent.ReadySig()
-
 	sh.initializeConnection()
 
 	// Close the connection for signaling when signal handler itself is terminated.
 	defer sh.connectionToSignal.Close()
 
+	sh.barrierWithChildren = NewThreadLifeCycleBarrier(2)
+
 	go sh.runPingSender()
-	sh.runPingRespHandler()
+	go sh.runPingRespHandler()
+
+	sh.barrierWithChildren.Ready()
+
+	sh.barrierWithParent.ReadySig()
+
+	sh.barrierWithChildren.Done()
 
 	log.Println("<INFO> Signal handler: Terminated")
 
@@ -506,53 +513,12 @@ func (sh *signalHandler) call(rpcname string, args interface{}, reply interface{
 	return err
 }
 
-func (sh *signalHandler) runPingSender() {
+func (sh *signalHandler) sendPing() {
 
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			isSent := sh.sendPing()
-			if !isSent {
-				time.Sleep(3 * time.Second) // Back-off sending a ping if worker profile is not assigned yet.
-			}
-		case <-sh.pingSenderLoopDone:
-			log.Println("<INFO> Signal handler: Quit the ping sender loop")
-			return
-		}
-	}
-
-}
-
-func (sh *signalHandler) runPingRespHandler() {
-
-	for {
-		select {
-		case resp := <-sh.pingRespChan:
-			switch resp.RespType {
-			case None:
-				log.Println("<INFO> Signal handler: Got a ping response without any notification")
-			case AllTasksCompleted:
-				log.Println("<INFO> Signal handler: Got a notification AllTasksCompleted from the coordinator")
-				sh.notifyTerminationToStateManager()
-			default:
-				log.Println("<Error> Signal handler: Got a notification with unknown type")
-			}
-		case <-sh.pingRespLoopDone:
-			log.Println("<INFO> Signal handler: Quit the ping response loop")
-			return
-		}
-	}
-
-}
-
-func (sh *signalHandler) sendPing() bool {
-
-	if sh.w.GetExecutionStage().currentStage == StageConnect {
+	if sh.w.GetExecutionStage().currentStage == StageConnect || !sh.w.state.profile.IsAssigned {
+		// Backoff: Cannot send a ping if the coordinator cannot identify this worker yet.
 		log.Println("<ERROR> Signal handler: Cannot send a ping if worker profile is not assigned from the coordinator yet.")
-		return false
+		return
 	}
 
 	args := PingArgs{}
@@ -564,14 +530,71 @@ func (sh *signalHandler) sendPing() bool {
 
 	err := sh.call(SignalPing, args, &reply)
 
+	// Unexpected errors specific to RPC call internal.
+	// Not related with ping response types.
 	if err != nil {
 		log.Printf("<ERROR> Signal handler: Failed to send a ping to the coordinator / %v", err)
-		return false
+		return
+	}
+
+	if reply.Resp.RespType == WorkerDead {
+		if !sh.isNotifiedWorkerDead {
+			sh.isNotifiedWorkerDead = true
+		} else {
+			// Deduplicate WorkerDead type ping responses.
+			// After the first one, do not send a message to the ping response handler
+			return
+		}
+
 	}
 
 	sh.pingRespChan <- reply.Resp
 
-	return true
+}
+
+func (sh *signalHandler) runPingSender() {
+	defer sh.barrierWithChildren.DoneSig()
+
+	sh.barrierWithChildren.ReadySig()
+
+	ticker := time.NewTicker(PingSendInterval * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			sh.sendPing()
+		case <-sh.pingSenderLoopDone:
+			log.Println("<INFO> Signal handler: Quit the ping sender loop")
+			return
+		}
+	}
+
+}
+
+func (sh *signalHandler) runPingRespHandler() {
+	defer sh.barrierWithChildren.DoneSig()
+
+	sh.barrierWithChildren.ReadySig()
+
+	for {
+		select {
+		case resp := <-sh.pingRespChan:
+			switch resp.RespType {
+			case None:
+				log.Println("<INFO> Signal handler: Ping response: Got a notification None from the coordinator")
+			case WorkerDead:
+				log.Println("<INFO> Signal handler: Ping response: Got a notification WorkerDead from the coordinator")
+				sh.notifyTerminationToStateManager()
+			default:
+				log.Println("<Error> Signal handler: Ping response: Got a notification Unknown from the coordinator")
+			}
+		case <-sh.pingRespLoopDone:
+			log.Println("<INFO> Signal handler: Quit the ping response loop")
+			return
+		}
+	}
+
 }
 
 func (sh *signalHandler) quitSignalHandler() {

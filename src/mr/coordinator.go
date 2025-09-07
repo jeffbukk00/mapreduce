@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -31,13 +32,6 @@ const (
 	Dead
 )
 
-type workerActivenessStatus int
-
-const (
-	Inactive workerActivenessStatus = iota // Inactive status represents "unscheduled with any task currently".
-	Active
-)
-
 // ------------------------
 // Task-related type definitions
 // ------------------------
@@ -45,16 +39,15 @@ type task struct {
 	class             TaskClass
 	seq               int
 	progressionStatus taskProgressionStatus
-	inputPath         []string
-	requiredInputs    int
-	scheduledWith     []*worker // Multiple workers can be scheduled with same task. As backup tasks for speculative execution.
 
-	// A task can be completed by only one worker.
-	// This field is not overwritten by backup completions,
-	// ensuring deduplication under speculative execution.
-	// The only exception is when rescheduling after the
-	// original completing worker has failed.
-	completedWith *worker
+	// For map tasks, this is an actual input file path.
+	// For reduce tasks, this is a partition id. Concatenated string(map task X's outputPath + reduce task Y's inputPath)
+	// can be an actual input file path for single partition of reduce task Y.
+	inputPath string
+
+	outputPath string
+
+	scheduledWith *worker
 }
 
 // taskSet tracks the state of all tasks in one place.
@@ -74,11 +67,11 @@ type taskQueue struct {
 // Worker-related type definitions
 // ------------------------
 type worker struct {
-	id               int
-	livenessStatus   workerLivenessStatus
-	activenessStatus workerActivenessStatus
-	scheduledWith    *task
-	tasksCompleted   []*task
+	id             int
+	livenessStatus workerLivenessStatus
+
+	scheduledWith []*task
+	lastPing      time.Time
 }
 
 // workerSet tracks the state of all workers in one place.
@@ -142,14 +135,60 @@ func (c *Coordinator) Run() {
 
 func (c *Coordinator) Terminate() {
 	c.stateOpChan <- func() {
+		go func() {
+			go c.coordinatorServer.stop()
+			go c.workerScanner.quitWorkerScanner()
 
-		c.coordinatorServer.stop()
-		c.workerScanner.quitWorkerScanner()
+			c.barrierWithChildren.Done()
 
-		c.barrierWithChildren.Done()
+			close(c.stateOpChan)
+		}()
 
-		close(c.stateOpChan)
 	}
+}
+
+func (c *Coordinator) DetectWorkerFailure(detectionPoint time.Time) {
+	done := make(chan struct{})
+
+	lifetime := time.Duration(WorkerLifetime) * time.Second
+
+	c.stateOpChan <- func() {
+
+		for _, w := range c.state.workerFiniteSet.workers {
+			// 1. Scan and detect failed workers
+			if w.livenessStatus == Dead {
+				continue
+			}
+
+			if detectionPoint.Sub(w.lastPing) <= lifetime {
+				continue
+			}
+
+			// 2. Update the state of failed workers as "Dead"
+
+			log.Printf("<INFO> State manager: Worker %d is dead", w.id)
+
+			w.livenessStatus = Dead
+
+			// 3. Enqueue pending or completed tasks on this failed worker to the task queue.
+			// For rescheduling.
+			for _, t := range w.scheduledWith {
+				log.Printf("<INFO> State manager: Task %d will be rescheduled", t.seq)
+
+				t.progressionStatus = Idle
+				t.outputPath = ""
+				t.scheduledWith = nil
+
+				c.state.idleTaskQueue.q = append(c.state.idleTaskQueue.q, t)
+			}
+
+			w.scheduledWith = nil
+		}
+
+		done <- struct{}{}
+	}
+
+	<-done
 }
 
 type acceptWorkerResp struct {
@@ -163,25 +202,65 @@ func (c *Coordinator) AcceptWorker() acceptWorkerResp {
 		acceptedWorkerID := c.state.workerFiniteSet.numWorkers
 
 		acceptededWorker := worker{
-			id:               acceptedWorkerID,
-			livenessStatus:   Alive,
-			activenessStatus: Inactive,
-			scheduledWith:    nil,
-			tasksCompleted:   make([]*task, 0),
+			id:             acceptedWorkerID,
+			livenessStatus: Alive,
 		}
 
 		c.state.workerFiniteSet.workers = append(c.state.workerFiniteSet.workers, &acceptededWorker)
 
 		c.state.workerFiniteSet.numWorkers++
 
+		acceptededWorker.lastPing = time.Now()
+
 		acceptedProfile := WorkerProfile{
-			ID: acceptedWorkerID,
+			IsAssigned: true,
+			ID:         acceptedWorkerID,
 		}
 
 		respChan <- acceptWorkerResp{profile: acceptedProfile}
 	}
 
 	return <-respChan
+}
+
+type isWorkerDeadReq struct {
+	id int
+}
+
+type isWorkerDeadResp struct {
+	flag bool
+}
+
+func (c *Coordinator) isWorkerDead(req isWorkerDeadReq) isWorkerDeadResp {
+	resp := make(chan isWorkerDeadResp)
+
+	c.stateOpChan <- func() {
+		w := c.state.workerFiniteSet.workers[req.id]
+
+		resp <- isWorkerDeadResp{
+			flag: w.livenessStatus == Dead,
+		}
+	}
+
+	return <-resp
+}
+
+type updateLastPingReq struct {
+	id int
+}
+
+func (c *Coordinator) updateLastPing(req updateLastPingReq) {
+	done := make(chan struct{})
+
+	c.stateOpChan <- func() {
+		log.Printf("<INFO> State manaer: Renew the lifetime of worker %d\n", req.id)
+
+		c.state.workerFiniteSet.workers[req.id].lastPing = time.Now()
+
+		done <- struct{}{}
+	}
+
+	<-done
 }
 
 // ------------------------
@@ -208,7 +287,7 @@ func (cs *CoordinatorServer) run() {
 	cs.server()
 
 	log.Println("<INFO> Coordinator server: Intialized")
-	cs.signalServer.pingCount = 4
+
 	cs.barrierWithParent.ReadySig()
 
 	cs.start()
@@ -299,15 +378,13 @@ func (cs *CoordinatorServer) Connect(args ConnectArgs, reply *ConnectReply) erro
 
 type SignalServer struct {
 	coord *Coordinator
-
-	pingCount int
 }
 
 type PingResponseType int
 
 const (
 	None = iota
-	AllTasksCompleted
+	WorkerDead
 )
 
 type PingResponse struct {
@@ -315,15 +392,22 @@ type PingResponse struct {
 }
 
 func (ss *SignalServer) Ping(args PingArgs, reply *PingReply) error {
-	log.Printf("<INFO> Signal server: Got a ping from the worker %d\n", args.WorkerID)
-	ss.pingCount--
 
-	if ss.pingCount <= 0 {
-		reply.Resp.RespType = AllTasksCompleted
+	reply.Resp.RespType = None
+
+	isWorkerDead := ss.coord.isWorkerDead(isWorkerDeadReq{id: args.WorkerID}).flag
+
+	// If worker is dead, do not update a timestamp.
+	if isWorkerDead {
+		reply.Resp.RespType = WorkerDead
 		return nil
 	}
 
-	reply.Resp.RespType = None
+	log.Printf("<INFO> Signal server: Got a ping from the worker %d\n", args.WorkerID)
+
+	ss.coord.updateLastPing(updateLastPingReq{
+		id: args.WorkerID,
+	})
 
 	return nil
 }
@@ -335,7 +419,7 @@ func (ss *SignalServer) Ping(args PingArgs, reply *PingReply) error {
 type workerScanner struct {
 	coord *Coordinator
 
-	isTerminated bool // For testing a graceful termination
+	wScannerLoopDone chan struct{}
 
 	barrierWithParent *ThreadLifecycleBarrier
 }
@@ -347,15 +431,31 @@ func (ws *workerScanner) run() {
 
 	ws.barrierWithParent.ReadySig()
 
-	for !ws.isTerminated {
-		time.Sleep(time.Second * 10)
-	}
+	ws.startWorkerScanner()
 
 	log.Println("<INFO> Worker scanner: Terminated")
 }
 
+func (ws *workerScanner) startWorkerScanner() {
+	ticker := time.NewTicker(WorkerLifetime * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			startToDetectFailure := time.Now()
+			ws.coord.DetectWorkerFailure(startToDetectFailure)
+			durationToDetectFailure := time.Since(startToDetectFailure)
+			log.Printf("<INFO> Worker scanner: Worker scanning took %v\n", durationToDetectFailure)
+		case <-ws.wScannerLoopDone:
+			log.Println("<INFO> Worker scanner: Quit the worker scanner loop")
+			return
+		}
+	}
+}
+
 func (ws *workerScanner) quitWorkerScanner() {
-	ws.isTerminated = true
+	ws.wScannerLoopDone <- struct{}{}
 }
 
 // ------------------------
@@ -381,8 +481,7 @@ func MakeCoordinator(files []string, nReduce int) {
 				reduceTasks:           make([]*task, nReduce),
 			},
 			workerFiniteSet: workerSet{
-				numWorkers: 0,
-				workers:    make([]*worker, 0),
+				workers: make([]*worker, 0),
 			},
 			idleTaskQueue: taskQueue{
 				q: make([]*task, 0),
@@ -396,10 +495,7 @@ func MakeCoordinator(files []string, nReduce int) {
 			class:             Map,
 			seq:               i,
 			progressionStatus: Idle,
-			inputPath:         []string{files[i]},
-			requiredInputs:    1,
-			scheduledWith:     make([]*worker, 0),
-			completedWith:     nil,
+			inputPath:         files[i],
 		}
 
 		c.state.taskFiniteSet.mapTasks[i] = mt
@@ -412,14 +508,12 @@ func MakeCoordinator(files []string, nReduce int) {
 			class:             Reduce,
 			seq:               i,
 			progressionStatus: Idle,
-			inputPath:         make([]string, c.state.taskFiniteSet.mapTasksToComplete),
-			requiredInputs:    c.state.taskFiniteSet.mapTasksToComplete,
-			scheduledWith:     nil,
+			inputPath:         strconv.Itoa(i),
 		}
 
 		c.state.taskFiniteSet.reduceTasks[i] = rt
 
-		c.state.idleTaskQueue.q = append(c.state.idleTaskQueue.q, rt)
+		// c.state.idleTaskQueue.q = append(c.state.idleTaskQueue.q, rt)
 	}
 
 	c.coordinatorServer = &CoordinatorServer{
