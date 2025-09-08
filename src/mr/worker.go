@@ -16,8 +16,7 @@ import (
 type executionStage int
 
 const (
-	StageConnect executionStage = iota
-	StageSchedule
+	StageSchedule executionStage = iota
 	StageFetchInput
 	StageProgressTask
 	StageCommitOutput
@@ -83,16 +82,11 @@ type KeyValue struct {
 type mapFunc func(string, string) []KeyValue
 type reduceFunc func(string, []string) string
 
-// ------------------------
-// Job type definitions
-// ------------------------
-
-// Job represent the state of currently progressing task in the worker.
+// AssignedTask represent the state of currently progressing task in the worker.
 // It is scheduled by the coorinator.
-type Job struct {
-	Class     TaskClass
-	Seq       int
-	InputPath []string
+type AssignedTask struct {
+	Class TaskClass
+	Seq   int
 }
 
 // ------------------------
@@ -106,11 +100,12 @@ type WorkerProfile struct {
 }
 
 type workerState struct {
-	profile    WorkerProfile
-	stage      executionStage
-	currentJob Job
-	mapf       mapFunc
-	reducef    reduceFunc
+	profile       WorkerProfile
+	stage         executionStage
+	task          AssignedTask
+	InputsToFetch []string
+	mapf          mapFunc
+	reducef       reduceFunc
 }
 
 /*
@@ -255,40 +250,33 @@ func (w *Worker) AssignWorkerProfile(req assignWorkerProfileReq) {
 	<-done
 }
 
-type getJobResp struct {
-	currentJob Job
+type getTaskResp struct {
+	task AssignedTask
 }
 
-func (w *Worker) GetJob() getJobResp {
-	resp := make(chan getJobResp)
+func (w *Worker) GetJob() getTaskResp {
+	resp := make(chan getTaskResp)
 
 	w.stateOpChan <- func() {
-		currentJob := Job{}
-		currentJob.Class = w.state.currentJob.Class
-		currentJob.Seq = w.state.currentJob.Seq
 
-		currentJob.InputPath = make([]string, len(w.state.currentJob.InputPath)) // Deep copying
-
-		resp <- getJobResp{
-			currentJob: currentJob,
+		resp <- getTaskResp{
+			task: w.state.task,
 		}
 	}
 
 	return <-resp
 }
 
-type assignJobReq struct {
-	job Job
+type assignTaskReq struct {
+	task AssignedTask
 }
 
-func (w *Worker) AssignJob(req assignJobReq) {
+func (w *Worker) AssignJob(req assignTaskReq) {
 	done := make(chan struct{})
 
 	w.stateOpChan <- func() {
 
-		// Warning: This is a shallow copy.
-		// But, there is a guarantee of no shared references.
-		w.state.currentJob = req.job
+		w.state.task = req.task
 
 		close(done)
 	}
@@ -300,6 +288,13 @@ func (w *Worker) AssignJob(req assignJobReq) {
 // Execution loop type definitions
 // ------------------------
 
+/*
+	<Execution loop>
+
+	MUST DO:
+	1) Warn: Always return to the loop for retrying(Don't retry in the handler).
+
+*/
 // ExecutionLoop loops a sequence of execution stages in strict order.
 type executionLoop struct {
 	stage executionStage
@@ -348,17 +343,13 @@ func (el *executionLoop) startLoop() {
 
 	var e executionStage
 
-	el.stageChan <- StageConnect
+	el.stageChan <- StageSchedule
 
 	for e = range el.stageChan {
 
 		el.stage = e
 
 		switch e {
-		case StageConnect:
-			el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageConnect})
-			log.Println("<INFO> Execution loop: Is at the Connect stage")
-			el.connect()
 		case StageSchedule:
 			el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageSchedule})
 			log.Println("<INFO> Execution loop: Is at the Schedule stage")
@@ -384,16 +375,14 @@ func (el *executionLoop) startLoop() {
 	log.Println("<INFO> Execution loop: Stop to loop")
 }
 
-func (el *executionLoop) connect() {
+func (el *executionLoop) schedule() {
+	args := ScheduleArgs{}
+	reply := ScheduleReply{}
 
-	args := ConnectArgs{}
-	reply := ConnectReply{}
-
-	err := el.call(CoordinatorConnect, &args, &reply)
+	err := el.call(CoordinatorSchedule, &args, &reply)
 
 	if err != nil {
-		// Fault tolerance: Retry policy is required.
-		log.Println("<ERROR> Execution loop: Failed to connect to the coordinator")
+		log.Printf("<ERROR> Execution loop: Failed to schedule: %v\n", err)
 		return
 	}
 
@@ -402,31 +391,19 @@ func (el *executionLoop) connect() {
 	// Update the global logger with assigned worker id.
 	prefix := fmt.Sprintf("[ WORKER | PID: %d | ID: %d ] ", os.Getpid(), reply.Profile.ID)
 	log.SetPrefix(prefix)
+
 	log.Printf("<INFO> Execution loop: Worker %d is Connected", reply.Profile.ID)
 
-	el.stageChan <- StageSchedule
+	el.w.AssignJob(assignTaskReq{task: reply.Task})
 
-}
-
-func (el *executionLoop) schedule() {
-	args := ScheduleArgs{}
-	reply := ScheduleReply{}
-
-	err := el.call(CoordinatorSchedule, &args, &reply)
-
-	if err != nil {
-		// Fault tolerance: Retry policy is required.
-		log.Println("<ERROR> Execution loop: Failed to schedule")
-		return
-	}
-
-	el.w.AssignJob(assignJobReq{job: reply.Task})
+	log.Printf("<INFO> Execution loop: %s task %d is scheduled\n", TaskClassToString(reply.Task.Class), reply.Task.Seq)
 
 	el.stageChan <- StageFetchInput
-
 }
 
 func (el *executionLoop) fetchInput() {
+	log.Println("<BREAKPOINT>")
+	time.Sleep(time.Second * 30) // Breakpoint: for testing the execution loop.
 	el.stageChan <- StageProgressTask
 
 }
@@ -515,7 +492,7 @@ func (sh *signalHandler) call(rpcname string, args interface{}, reply interface{
 
 func (sh *signalHandler) sendPing() {
 
-	if sh.w.GetExecutionStage().currentStage == StageConnect || !sh.w.state.profile.IsAssigned {
+	if sh.w.GetExecutionStage().currentStage == StageSchedule || !sh.w.state.profile.IsAssigned {
 		// Backoff: Cannot send a ping if the coordinator cannot identify this worker yet.
 		log.Println("<ERROR> Signal handler: Cannot send a ping if worker profile is not assigned from the coordinator yet.")
 		return
@@ -652,10 +629,10 @@ func MakeWorker(mapf mapFunc, reducef reduceFunc) {
 
 	w := Worker{
 		state: workerState{
-			profile:    WorkerProfile{},
-			currentJob: Job{},
-			mapf:       mapf,
-			reducef:    reducef,
+			profile: WorkerProfile{},
+			task:    AssignedTask{},
+			mapf:    mapf,
+			reducef: reducef,
 		},
 
 		stateOpChan: make(chan func(), 100),

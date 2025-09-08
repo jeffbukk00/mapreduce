@@ -15,7 +15,6 @@ const (
 )
 
 const (
-	CoordinatorConnect  = "CoordinatorService.Connect"
 	CoordinatorSchedule = "CoordinatorService.Schedule"
 )
 
@@ -28,22 +27,14 @@ const (
 // Args and reply type definitions for general RPC methods
 // ------------------------
 
-// ConnectArgs is an argument type of RPC method "CoordinatorService.Connect"
-type ConnectArgs struct{}
-
-// ConnectReply is an return type of RPC method "CoordinatorService.Connect"
-type ConnectReply struct {
-	Profile WorkerProfile
-}
-
 // ScheduleArgs is an argument type of RPC method "CoordinatorService.Connect"
 type ScheduleArgs struct {
-	WorkerID int
 }
 
 // ScheduleReply is an return type of RPC method "CoordinatorService.Connect"
 type ScheduleReply struct {
-	Task Job
+	Profile WorkerProfile
+	Task    AssignedTask
 }
 
 // ------------------------

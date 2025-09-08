@@ -8,6 +8,14 @@ const (
 	Reduce
 )
 
+func TaskClassToString(class TaskClass) string {
+	if class == Map {
+		return "Map"
+	}
+
+	return "Reduce"
+}
+
 // ------------------------
 // Failure Detection Policies
 // ------------------------

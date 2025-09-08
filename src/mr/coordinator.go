@@ -166,20 +166,21 @@ func (c *Coordinator) DetectWorkerFailure(detectionPoint time.Time) {
 
 			// 2. Update the state of failed workers as "Dead"
 
-			log.Printf("<INFO> State manager: Worker %d is dead", w.id)
-
 			w.livenessStatus = Dead
+
+			log.Printf("<INFO> State manager: Worker %d is dead", w.id)
 
 			// 3. Enqueue pending or completed tasks on this failed worker to the task queue.
 			// For rescheduling.
 			for _, t := range w.scheduledWith {
-				log.Printf("<INFO> State manager: Task %d will be rescheduled", t.seq)
 
 				t.progressionStatus = Idle
 				t.outputPath = ""
 				t.scheduledWith = nil
 
 				c.state.idleTaskQueue.q = append(c.state.idleTaskQueue.q, t)
+
+				log.Printf("<INFO> State manager: Task %d will be rescheduled", t.seq)
 			}
 
 			w.scheduledWith = nil
@@ -189,38 +190,6 @@ func (c *Coordinator) DetectWorkerFailure(detectionPoint time.Time) {
 	}
 
 	<-done
-}
-
-type acceptWorkerResp struct {
-	profile WorkerProfile
-}
-
-func (c *Coordinator) AcceptWorker() acceptWorkerResp {
-	respChan := make(chan acceptWorkerResp, 1)
-
-	c.stateOpChan <- func() {
-		acceptedWorkerID := c.state.workerFiniteSet.numWorkers
-
-		acceptededWorker := worker{
-			id:             acceptedWorkerID,
-			livenessStatus: Alive,
-		}
-
-		c.state.workerFiniteSet.workers = append(c.state.workerFiniteSet.workers, &acceptededWorker)
-
-		c.state.workerFiniteSet.numWorkers++
-
-		acceptededWorker.lastPing = time.Now()
-
-		acceptedProfile := WorkerProfile{
-			IsAssigned: true,
-			ID:         acceptedWorkerID,
-		}
-
-		respChan <- acceptWorkerResp{profile: acceptedProfile}
-	}
-
-	return <-respChan
 }
 
 type isWorkerDeadReq struct {
@@ -253,9 +222,10 @@ func (c *Coordinator) updateLastPing(req updateLastPingReq) {
 	done := make(chan struct{})
 
 	c.stateOpChan <- func() {
-		log.Printf("<INFO> State manaer: Renew the lifetime of worker %d\n", req.id)
 
 		c.state.workerFiniteSet.workers[req.id].lastPing = time.Now()
+
+		log.Printf("<INFO> State manaer: Renew the lifetime of worker %d\n", req.id)
 
 		done <- struct{}{}
 	}
@@ -263,8 +233,84 @@ func (c *Coordinator) updateLastPing(req updateLastPingReq) {
 	<-done
 }
 
+type scheduleTaskResp struct {
+	profile WorkerProfile
+	task    AssignedTask
+	err     error
+}
+
+func (c *Coordinator) scheduleTask() scheduleTaskResp {
+	respChan := make(chan scheduleTaskResp, 1)
+
+	c.stateOpChan <- func() {
+		// Combine 2 different ops into one transaction boundary to save a round trip.
+		resp := scheduleTaskResp{}
+
+		// Op1: Accept a worker and assign new worker id to it.
+		acceptedWorkerID := c.state.workerFiniteSet.numWorkers
+
+		acceptededWorker := worker{
+			id:             acceptedWorkerID,
+			livenessStatus: Alive,
+		}
+
+		c.state.workerFiniteSet.workers = append(c.state.workerFiniteSet.workers, &acceptededWorker)
+
+		c.state.workerFiniteSet.numWorkers++
+
+		acceptededWorker.lastPing = time.Now()
+
+		acceptedProfile := WorkerProfile{
+			IsAssigned: true,
+			ID:         acceptedWorkerID,
+		}
+
+		resp.profile = acceptedProfile
+
+		// Op2: Assign a task to this worker.
+
+		if len(c.state.idleTaskQueue.q) == 0 {
+			log.Println("<Error> State manager: Failed to assign a task because there is no queued task now")
+
+			// Rollback the Op1.
+			c.state.workerFiniteSet.workers = c.state.workerFiniteSet.workers[0 : len(c.state.workerFiniteSet.workers)-1]
+			c.state.workerFiniteSet.numWorkers--
+			resp.profile = WorkerProfile{}
+			resp.err = fmt.Errorf("no task to assign now")
+
+			respChan <- resp
+			return
+		}
+
+		w := c.state.workerFiniteSet.workers[resp.profile.ID]
+
+		enqueuedTask := c.state.idleTaskQueue.q[0]
+		c.state.idleTaskQueue.q = c.state.idleTaskQueue.q[1:]
+
+		enqueuedTask.progressionStatus = Pending
+		enqueuedTask.scheduledWith = w
+
+		w.scheduledWith = append(w.scheduledWith, enqueuedTask)
+
+		assignedTask := AssignedTask{
+			Class: enqueuedTask.class,
+			Seq:   enqueuedTask.seq,
+		}
+
+		resp.task = assignedTask
+
+		log.Printf("<INFO> State manager: Worker %d is initialized\n", resp.profile.ID)
+		log.Printf("<INFO> State manager: %s task %d is scheduled with the worker %d\n",
+			TaskClassToString(resp.task.Class), resp.task.Seq, resp.profile.ID)
+
+		respChan <- resp
+	}
+
+	return <-respChan
+}
+
 // ------------------------
-// RPC server definitions for a coordinator. Separation of networking concerns.
+// Coordinator server definitions
 // ------------------------
 
 // CoordinatorServer is a single listener to handle both of general RPC requests and signaling concerns.
@@ -364,18 +410,25 @@ func (cs *CoordinatorServer) stop() {
 	}
 }
 
-func (cs *CoordinatorServer) Connect(args ConnectArgs, reply *ConnectReply) error {
+func (cs *CoordinatorServer) Schedule(args ScheduleArgs, reply *ScheduleReply) error {
+	resp := cs.coord.scheduleTask()
 
-	resp := cs.coord.AcceptWorker()
+	if resp.err != nil {
+		return fmt.Errorf("RPC call: CoordinatorService.Schedule: %v", resp.err)
+	}
 
-	// reply
 	reply.Profile = resp.profile
-
-	log.Printf("<INFO> Coordinator server: Worker %d is initialized\n", resp.profile.ID)
+	reply.Task = resp.task
 
 	return nil
 }
 
+// ------------------------
+// Signal server definitions
+// ------------------------
+
+// SignalServer is a RPC object wrapping methods handling with pings and notifications.
+// Single port: Served by same port with the coordinator server.
 type SignalServer struct {
 	coord *Coordinator
 }
