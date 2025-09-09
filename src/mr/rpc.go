@@ -15,7 +15,8 @@ const (
 )
 
 const (
-	CoordinatorSchedule = "CoordinatorService.Schedule"
+	CoordinatorSchedule       = "CoordinatorService.Schedule"
+	CoordinatorFetchInputPath = "CoordinatorService.FetchInputPath"
 )
 
 const (
@@ -27,14 +28,26 @@ const (
 // Args and reply type definitions for general RPC methods
 // ------------------------
 
-// ScheduleArgs is an argument type of RPC method "CoordinatorService.Connect"
+// ScheduleArgs is an argument type of RPC method "CoordinatorService.Schedule"
 type ScheduleArgs struct {
 }
 
-// ScheduleReply is an return type of RPC method "CoordinatorService.Connect"
+// ScheduleReply is an return type of RPC method "CoordinatorService.Schedule"
 type ScheduleReply struct {
 	Profile WorkerProfile
 	Task    AssignedTask
+}
+
+// FetchInputPathArgs is an argument type of RPC method "CoordinatorService.FetchInputPath"
+type FetchInputPathArgs struct {
+	Profile     WorkerProfile
+	Task        AssignedTask
+	WhatToFetch []int
+}
+
+// FetchInputPathReply is an return type of RPC method "CoordinatorService.FetchInputPath"
+type FetchInputPathReply struct {
+	InputPaths []Input
 }
 
 // ------------------------

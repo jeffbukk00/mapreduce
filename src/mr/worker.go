@@ -3,9 +3,11 @@ package mr
 import (
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"sync"
 	"time"
 )
@@ -17,7 +19,8 @@ type executionStage int
 
 const (
 	StageSchedule executionStage = iota
-	StageFetchInput
+	StageFetchInputPath
+	StageShuffle
 	StageProgressTask
 	StageCommitOutput
 	StageTerminateLoop
@@ -76,6 +79,12 @@ type KeyValue struct {
 	Value string
 }
 
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 // mapFunc defines the signature for a user-defined map function.
 // reduceFunc defines the signature for a user-defined reduce function.
 // These are dynamically loaded through the Go plugin system.
@@ -85,8 +94,23 @@ type reduceFunc func(string, []string) string
 // AssignedTask represent the state of currently progressing task in the worker.
 // It is scheduled by the coorinator.
 type AssignedTask struct {
-	Class TaskClass
-	Seq   int
+	Class      TaskClass
+	Seq        int
+	NumInputs  int
+	NumOutputs int
+}
+
+// Input is the fetching state for a dedicated path.
+type Input struct {
+	Path      string
+	IsFetched bool
+}
+
+type inputFetchTracker struct {
+	isInit          bool
+	inputFetchState []Input
+	whatToFetch     []int
+	fetchedInputs   []string
 }
 
 // ------------------------
@@ -100,12 +124,11 @@ type WorkerProfile struct {
 }
 
 type workerState struct {
-	profile       WorkerProfile
-	stage         executionStage
-	task          AssignedTask
-	InputsToFetch []string
-	mapf          mapFunc
-	reducef       reduceFunc
+	profile WorkerProfile
+	task    AssignedTask
+
+	mapf    mapFunc
+	reducef reduceFunc
 }
 
 /*
@@ -134,7 +157,7 @@ type Worker struct {
 	barrierWithChildren *ThreadLifecycleBarrier
 }
 
-func (w *Worker) Run() {
+func (w *Worker) run() {
 	defer w.barrierWithParent.DoneSig()
 
 	log.Println("<INFO> State manager: Intialized")
@@ -167,7 +190,7 @@ func (w *Worker) Run() {
 	log.Println("<INFO> State manager: Terminated")
 }
 
-func (w *Worker) Terminate() {
+func (w *Worker) terminate() {
 
 	w.stateOpChan <- func() {
 		go func() {
@@ -186,42 +209,11 @@ func (w *Worker) Terminate() {
 	// No synchronization with the caller.
 }
 
-type getExecutionStageResp struct {
-	currentStage executionStage
-}
-
-func (w *Worker) GetExecutionStage() getExecutionStageResp {
-	resp := make(chan getExecutionStageResp)
-
-	w.stateOpChan <- func() {
-		resp <- getExecutionStageResp{currentStage: w.state.stage}
-	}
-
-	return <-resp
-}
-
-type updateExecutionStageReq struct {
-	updatedStage executionStage
-}
-
-func (w *Worker) UpdateExecutionStage(req updateExecutionStageReq) {
-	done := make(chan struct{})
-
-	w.stateOpChan <- func() {
-		w.state.stage = req.updatedStage
-
-		done <- struct{}{}
-	}
-
-	<-done
-
-}
-
 type getWorkerProfileResp struct {
 	profile WorkerProfile
 }
 
-func (w *Worker) GetWorkerProfile() getWorkerProfileResp {
+func (w *Worker) getWorkerProfile() getWorkerProfileResp {
 	resp := make(chan getWorkerProfileResp)
 
 	w.stateOpChan <- func() {
@@ -237,7 +229,7 @@ type assignWorkerProfileReq struct {
 	profile WorkerProfile
 }
 
-func (w *Worker) AssignWorkerProfile(req assignWorkerProfileReq) {
+func (w *Worker) assignWorkerProfile(req assignWorkerProfileReq) {
 	done := make(chan struct{})
 
 	w.stateOpChan <- func() {
@@ -254,7 +246,7 @@ type getTaskResp struct {
 	task AssignedTask
 }
 
-func (w *Worker) GetJob() getTaskResp {
+func (w *Worker) getTask() getTaskResp {
 	resp := make(chan getTaskResp)
 
 	w.stateOpChan <- func() {
@@ -271,7 +263,7 @@ type assignTaskReq struct {
 	task AssignedTask
 }
 
-func (w *Worker) AssignJob(req assignTaskReq) {
+func (w *Worker) assignTask(req assignTaskReq) {
 	done := make(chan struct{})
 
 	w.stateOpChan <- func() {
@@ -282,6 +274,38 @@ func (w *Worker) AssignJob(req assignTaskReq) {
 	}
 
 	<-done
+}
+
+type getMapFuncResp struct {
+	mapFunc mapFunc
+}
+
+func (w *Worker) getMapFunc() getMapFuncResp {
+	respChan :=
+		make(chan getMapFuncResp)
+
+	w.stateOpChan <- func() {
+		respChan <- getMapFuncResp{mapFunc: w.state.mapf}
+	}
+
+	return <-respChan
+}
+
+type getReduceFuncResp struct {
+	reduceFunc reduceFunc
+}
+
+func (w *Worker) getReduceFunc() getReduceFuncResp {
+	respChan :=
+		make(chan getReduceFuncResp)
+
+	w.stateOpChan <- func() {
+		respChan <- getReduceFuncResp{
+			reduceFunc: w.state.reducef,
+		}
+	}
+
+	return <-respChan
 }
 
 // ------------------------
@@ -300,6 +324,8 @@ type executionLoop struct {
 	stage executionStage
 
 	stageChan chan executionStage
+
+	inputFetcher inputFetchTracker
 
 	w *Worker
 
@@ -351,19 +377,18 @@ func (el *executionLoop) startLoop() {
 
 		switch e {
 		case StageSchedule:
-			el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageSchedule})
 			log.Println("<INFO> Execution loop: Is at the Schedule stage")
 			el.schedule()
-		case StageFetchInput:
-			el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageFetchInput})
-			log.Println("<INFO> Execution loop: Is at the FetchInput stage")
-			el.fetchInput()
+		case StageFetchInputPath:
+			log.Println("<INFO> Execution loop: Is at the FetchInputPath stage")
+			el.fetchInputPath()
+		case StageShuffle:
+			log.Println("<INFO> Execution loop: Is at the Shuffle stage")
+			el.shuffle()
 		case StageProgressTask:
-			el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageProgressTask})
 			log.Println("<INFO> Execution loop: Is at the ProgressTask stage")
 			el.processTask()
 		case StageCommitOutput:
-			el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageSchedule})
 			log.Println("<INFO> Execution loop: Is at the CommitOutput stage")
 			el.commitOutput()
 		case StageTerminateLoop:
@@ -383,10 +408,12 @@ func (el *executionLoop) schedule() {
 
 	if err != nil {
 		log.Printf("<ERROR> Execution loop: Failed to schedule: %v\n", err)
+		// Retry
+		el.stageChan <- StageSchedule
 		return
 	}
 
-	el.w.AssignWorkerProfile(assignWorkerProfileReq{profile: reply.Profile})
+	el.w.assignWorkerProfile(assignWorkerProfileReq{profile: reply.Profile})
 
 	// Update the global logger with assigned worker id.
 	prefix := fmt.Sprintf("[ WORKER | PID: %d | ID: %d ] ", os.Getpid(), reply.Profile.ID)
@@ -394,26 +421,205 @@ func (el *executionLoop) schedule() {
 
 	log.Printf("<INFO> Execution loop: Worker %d is Connected", reply.Profile.ID)
 
-	el.w.AssignJob(assignTaskReq{task: reply.Task})
+	el.w.assignTask(assignTaskReq{task: reply.Task})
 
 	log.Printf("<INFO> Execution loop: %s task %d is scheduled\n", TaskClassToString(reply.Task.Class), reply.Task.Seq)
 
-	el.stageChan <- StageFetchInput
+	el.stageChan <- StageFetchInputPath
 }
 
-func (el *executionLoop) fetchInput() {
-	log.Println("<BREAKPOINT>")
-	time.Sleep(time.Second * 30) // Breakpoint: for testing the execution loop.
+func (el *executionLoop) fetchInputPath() {
+	p := el.w.getWorkerProfile().profile
+	t := el.w.getTask().task
+
+	if !el.inputFetcher.isInit {
+		// Initialize once per a task
+		el.inputFetcher.inputFetchState = make([]Input, t.NumInputs)
+		el.inputFetcher.fetchedInputs = make([]string, t.NumInputs)
+		el.inputFetcher.whatToFetch = make([]int, 0)
+
+		for i := range el.inputFetcher.inputFetchState {
+			el.inputFetcher.whatToFetch = append(el.inputFetcher.whatToFetch, i)
+		}
+
+		el.inputFetcher.isInit = true
+	}
+
+	args := FetchInputPathArgs{
+		Profile:     p,
+		Task:        t,
+		WhatToFetch: el.inputFetcher.whatToFetch,
+	}
+
+	reply := FetchInputPathReply{}
+
+	err := el.call(CoordinatorFetchInputPath, &args, &reply)
+
+	if err != nil {
+		log.Printf("<ERROR> Execution loop: Failed to : %v\n", err)
+		// Retry
+		el.stageChan <- StageFetchInputPath
+		return
+	}
+
+	for i, v := range el.inputFetcher.whatToFetch {
+		el.inputFetcher.inputFetchState[v] = reply.InputPaths[i]
+		log.Printf("<INFO> Execution loop: Fetched input path: %s\n", reply.InputPaths[i].Path)
+	}
+
+	log.Println("<INFO> Execution loop: Input paths are fetched")
+
+	el.stageChan <- StageShuffle
+}
+
+func (el *executionLoop) shuffle() {
+	t := el.w.getTask().task
+
+	// Local file reader for an input of a map task.
+	read := func(path string, seq int, inputIdx int) {
+		file, err := os.Open(path)
+		if err != nil {
+			log.Fatalf("<FATAL> Non-recoverable error from local file open: %v", err)
+		}
+
+		defer file.Close()
+
+		content, err := io.ReadAll(file)
+
+		if err != nil {
+			log.Fatalf("<FATAL> Non-recoverable error from local file read: %v", err)
+		}
+
+		log.Printf("<INFO> Fetched: %s\n", string(content[:50]))
+		// Loads a fetched input to the memory.
+		el.inputFetcher.fetchedInputs[inputIdx] = string(content)
+	}
+
+	// // Remote fetcher for inputs of a reduce task from other.
+	// fetch := func() (int, error) {
+	// 	// Define its own failure detection policy.(ex. "3 retry and 5s timeout per a try")
+	// }
+
+	wg := sync.WaitGroup{}
+
+	whatToFetch := make([]int, 0)
+
+	for _, v := range el.inputFetcher.whatToFetch {
+
+		path := el.inputFetcher.inputFetchState[v].Path
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			log.Printf("<INFO> Execution loop: Try to read %s for a %s task %d\n", path,
+				TaskClassToString(t.Class), t.Seq)
+
+			read(path, t.Seq, v)
+
+			/*
+				<Retrying mechanism on fetching from asynchronous network>
+				unfetchedInput, err := fetch()
+
+				if unfetchedInput >= 0 && err != nil {
+
+					log.Printf("<ERROR> Execution loop: %v\n", err)
+					whatToFetch = append(whatToFetch, unfetchedInput)
+				}
+			*/
+		}()
+
+	}
+
+	wg.Wait()
+
+	// If some fetches failed, return to StateFetchInputPath for retrying on only failed inputs/paths.
+	if len(whatToFetch) > 0 {
+		el.stageChan <- StageFetchInputPath
+		return
+	}
+
+	log.Println("<INFO> Execution loop: Shuffle is succeeded; All inputs are fetched")
+
 	el.stageChan <- StageProgressTask
 
 }
 
 func (el *executionLoop) processTask() {
+	w := el.w.getWorkerProfile().profile
+	t := el.w.getTask().task
+
+	write := func(path string, listKV []KeyValue) {
+		// Writes to local FS.
+		file, err := os.Create(path)
+		if err != nil {
+			log.Fatalf("<FATAL> Non-recoverable error from local file create: %s: %v", path, err)
+		}
+		defer file.Close()
+
+		for _, v := range listKV {
+			_, err := fmt.Fprintf(file, "%v %v\n", v.Key, v.Value)
+
+			if err != nil {
+				log.Fatalf("<FATAL> Non-recoverable error from local file write: %s: %v", path, err)
+			}
+
+		}
+	}
+
+	setContextForMapTaskExec := func(mapFunc mapFunc) {
+
+		// Single input for a map task
+		inputFilename := el.inputFetcher.inputFetchState[0].Path
+		content := el.inputFetcher.fetchedInputs[0]
+
+		output := mapFunc(inputFilename, content)
+
+		getOutputFilename := func(partition int) string {
+			return fmt.Sprintf("output-worker-%v-map-%v-%v.txt", w.ID, t.Seq, partition)
+		}
+
+		numPartitions := t.NumOutputs
+		partitions := make([][]KeyValue, t.NumOutputs)
+
+		for _, v := range output {
+			hash := ihash(v.Key)
+			p := hash % numPartitions
+
+			if partitions[p] == nil {
+				partitions[p] = make([]KeyValue, 0)
+			}
+
+			partitions[p] = append(partitions[p], v)
+		}
+
+		for i, v := range partitions {
+			sort.Sort(ByKey(v)) // Ordering is guaranteed per a partition.
+
+			write(getOutputFilename(i), v)
+		}
+	}
+
+	setContextForReduceTaskExec := func(reduceFunc reduceFunc) {
+		// Inputs(intermidiate KVs) for a reduce task must be ordered and grouped with the same key.
+
+		// Atomic rename
+	}
+
+	if t.Class == Map {
+		setContextForMapTaskExec(el.w.getMapFunc().mapFunc)
+	} else {
+		setContextForReduceTaskExec(el.w.getReduceFunc().reduceFunc)
+	}
+
+	log.Println("<INFO> Execution loop: Task is fully-processed; All outputs are written")
 	el.stageChan <- StageCommitOutput
-	el.w.UpdateExecutionStage(updateExecutionStageReq{updatedStage: StageCommitOutput})
 }
 
 func (el *executionLoop) commitOutput() {
+	log.Println("<BREAKPOINT>")
+	time.Sleep(time.Second * 30) // Breakpoint: for testing the execution loop.
+	// Required: Clear up prior task's context.
 
 	el.stageChan <- StageSchedule // Loop. Return to StageSchedule.
 
@@ -492,7 +698,7 @@ func (sh *signalHandler) call(rpcname string, args interface{}, reply interface{
 
 func (sh *signalHandler) sendPing() {
 
-	if sh.w.GetExecutionStage().currentStage == StageSchedule || !sh.w.state.profile.IsAssigned {
+	if !sh.w.state.profile.IsAssigned {
 		// Backoff: Cannot send a ping if the coordinator cannot identify this worker yet.
 		log.Println("<ERROR> Signal handler: Cannot send a ping if worker profile is not assigned from the coordinator yet.")
 		return
@@ -501,7 +707,7 @@ func (sh *signalHandler) sendPing() {
 	args := PingArgs{}
 	reply := PingReply{}
 
-	args.WorkerID = sh.w.GetWorkerProfile().profile.ID
+	args.WorkerID = sh.w.getWorkerProfile().profile.ID
 
 	log.Println("<INFO> Signal handler: Try to send a ping to the coordinator")
 
@@ -581,7 +787,7 @@ func (sh *signalHandler) quitSignalHandler() {
 }
 
 func (sh *signalHandler) notifyTerminationToStateManager() {
-	sh.w.Terminate() // Notify to the state manger to start a graceful termination.
+	sh.w.terminate() // Notify to the state manger to start a graceful termination.
 }
 
 // ------------------------
@@ -629,8 +835,6 @@ func MakeWorker(mapf mapFunc, reducef reduceFunc) {
 
 	w := Worker{
 		state: workerState{
-			profile: WorkerProfile{},
-			task:    AssignedTask{},
 			mapf:    mapf,
 			reducef: reducef,
 		},
@@ -657,7 +861,7 @@ func MakeWorker(mapf mapFunc, reducef reduceFunc) {
 
 	w.barrierWithParent = b
 
-	go w.Run()
+	go w.run()
 
 	b.Ready()
 

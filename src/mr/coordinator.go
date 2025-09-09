@@ -292,9 +292,19 @@ func (c *Coordinator) scheduleTask() scheduleTaskResp {
 
 		w.scheduledWith = append(w.scheduledWith, enqueuedTask)
 
+		numInputs := 1
+		numOutputs := c.state.taskFiniteSet.reduceTasksToComplete // The number of partitions.
+
+		if enqueuedTask.class == Reduce {
+			numInputs = c.state.taskFiniteSet.mapTasksToComplete
+			numOutputs = 1
+		}
+
 		assignedTask := AssignedTask{
-			Class: enqueuedTask.class,
-			Seq:   enqueuedTask.seq,
+			Class:      enqueuedTask.class,
+			Seq:        enqueuedTask.seq,
+			NumInputs:  numInputs,
+			NumOutputs: numOutputs,
 		}
 
 		resp.task = assignedTask
@@ -304,6 +314,47 @@ func (c *Coordinator) scheduleTask() scheduleTaskResp {
 			TaskClassToString(resp.task.Class), resp.task.Seq, resp.profile.ID)
 
 		respChan <- resp
+	}
+
+	return <-respChan
+}
+
+type prepareInputPathsReq struct {
+	profile     WorkerProfile
+	task        AssignedTask
+	whatToFetch []int
+}
+
+type prepareInputPathsResp struct {
+	inputPaths []Input
+	err        error
+}
+
+func (c *Coordinator) prepareInputPaths(req prepareInputPathsReq) prepareInputPathsResp {
+	respChan := make(chan prepareInputPathsResp)
+
+	if req.task.Class == Map {
+		// Prepare input paths for a map task.
+		c.stateOpChan <- func() {
+			task := c.state.taskFiniteSet.mapTasks[req.task.Seq]
+
+			inputPaths := make([]Input, 1)
+
+			inputPaths[0] = Input{
+				Path: task.inputPath,
+			}
+
+			respChan <- prepareInputPathsResp{
+				inputPaths: inputPaths,
+			}
+		}
+
+	} else {
+		// Prepare input paths for a reduce task.
+		c.stateOpChan <- func() {
+
+		}
+
 	}
 
 	return <-respChan
@@ -419,6 +470,22 @@ func (cs *CoordinatorServer) Schedule(args ScheduleArgs, reply *ScheduleReply) e
 
 	reply.Profile = resp.profile
 	reply.Task = resp.task
+
+	return nil
+}
+
+func (cs *CoordinatorServer) FetchInputPath(args FetchInputPathArgs, reply *FetchInputPathReply) error {
+	resp := cs.coord.prepareInputPaths(prepareInputPathsReq{
+		profile:     args.Profile,
+		task:        args.Task,
+		whatToFetch: args.WhatToFetch,
+	})
+
+	if resp.err != nil {
+		return fmt.Errorf("RPC call: CoordinatorService.FetchInputPath: %v", resp.err)
+	}
+
+	reply.InputPaths = resp.inputPaths
 
 	return nil
 }
