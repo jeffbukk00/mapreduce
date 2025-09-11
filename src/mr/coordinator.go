@@ -45,22 +45,28 @@ type task struct {
 	// can be an actual input file path for single partition of reduce task Y.
 	inputPath string
 
-	outputPath string
+	outputPath []string
 
 	scheduledWith *worker
+
+	isCompleted bool
 }
 
 // taskSet tracks the state of all tasks in one place.
 // The number of tasks is fixed and does not change dynamically.
 type taskSet struct {
-	mapTasksToComplete    int
-	mapTasks              []*task
-	reduceTasksToComplete int
-	reduceTasks           []*task
+	mapTasksToComplete  int
+	mapTasks            []*task
+	mapPhaseIsCompleted bool
+
+	reduceTasksToComplete  int
+	reduceTasks            []*task
+	reducePhaseIsCompleted bool
 }
 
 type taskQueue struct {
-	q []*task
+	mapTaskQueue    []*task
+	reduceTaskQueue []*task
 }
 
 // ------------------------
@@ -147,6 +153,38 @@ func (c *Coordinator) Terminate() {
 	}
 }
 
+func (c *Coordinator) completeMapPhase() {
+	if c.state.taskFiniteSet.mapPhaseIsCompleted {
+		return
+	}
+
+	for _, v := range c.state.taskFiniteSet.mapTasks {
+		if !v.isCompleted {
+			return
+		}
+	}
+
+	c.state.taskFiniteSet.mapPhaseIsCompleted = true
+	log.Println("<INFO> State manager: Completed the map phase")
+}
+
+func (c *Coordinator) completeReducePhase() {
+	if c.state.taskFiniteSet.reducePhaseIsCompleted {
+		return
+	}
+
+	for _, v := range c.state.taskFiniteSet.reduceTasks {
+		if !v.isCompleted {
+			return
+		}
+	}
+
+	c.state.taskFiniteSet.reducePhaseIsCompleted = true
+	log.Println("<INFO> State manager: Completed the reduce phase")
+
+	c.Terminate()
+}
+
 func (c *Coordinator) DetectWorkerFailure(detectionPoint time.Time) {
 	done := make(chan struct{})
 
@@ -175,12 +213,18 @@ func (c *Coordinator) DetectWorkerFailure(detectionPoint time.Time) {
 			for _, t := range w.scheduledWith {
 
 				t.progressionStatus = Idle
-				t.outputPath = ""
+				t.outputPath = nil
 				t.scheduledWith = nil
 
-				c.state.idleTaskQueue.q = append(c.state.idleTaskQueue.q, t)
+				if t.class == Map {
+					c.state.idleTaskQueue.mapTaskQueue = append(c.state.idleTaskQueue.mapTaskQueue, t)
+					c.state.taskFiniteSet.mapPhaseIsCompleted = false
+				} else {
+					c.state.idleTaskQueue.reduceTaskQueue = append(c.state.idleTaskQueue.reduceTaskQueue, t)
+					c.state.taskFiniteSet.reducePhaseIsCompleted = false
+				}
 
-				log.Printf("<INFO> State manager: Task %d will be rescheduled", t.seq)
+				log.Printf("<INFO> State manager: %v task %d will be rescheduled", TaskClassToString(t.class), t.seq)
 			}
 
 			w.scheduledWith = nil
@@ -233,59 +277,100 @@ func (c *Coordinator) updateLastPing(req updateLastPingReq) {
 	<-done
 }
 
-type scheduleTaskResp struct {
+type assignWorkerResp struct {
 	profile WorkerProfile
-	task    AssignedTask
 	err     error
 }
 
-func (c *Coordinator) scheduleTask() scheduleTaskResp {
-	respChan := make(chan scheduleTaskResp, 1)
+func (c *Coordinator) assignWorker() assignWorkerResp {
+	respChan := make(chan assignWorkerResp)
 
 	c.stateOpChan <- func() {
-		// Combine 2 different ops into one transaction boundary to save a round trip.
-		resp := scheduleTaskResp{}
-
-		// Op1: Accept a worker and assign new worker id to it.
 		acceptedWorkerID := c.state.workerFiniteSet.numWorkers
 
 		acceptededWorker := worker{
 			id:             acceptedWorkerID,
 			livenessStatus: Alive,
+			lastPing:       time.Now(),
 		}
 
 		c.state.workerFiniteSet.workers = append(c.state.workerFiniteSet.workers, &acceptededWorker)
 
 		c.state.workerFiniteSet.numWorkers++
 
-		acceptededWorker.lastPing = time.Now()
+		log.Printf("<INFO> State manager: Worker %d is initialized\n", acceptedWorkerID)
 
-		acceptedProfile := WorkerProfile{
-			IsAssigned: true,
-			ID:         acceptedWorkerID,
+		respChan <- assignWorkerResp{
+			profile: WorkerProfile{
+				IsAssigned: true,
+				ID:         acceptedWorkerID,
+			},
 		}
+	}
 
-		resp.profile = acceptedProfile
+	return <-respChan
+}
 
-		// Op2: Assign a task to this worker.
+type scheduleTaskReq struct {
+	profile WorkerProfile
+}
 
-		if len(c.state.idleTaskQueue.q) == 0 {
-			log.Println("<Error> State manager: Failed to assign a task because there is no queued task now")
+type scheduleTaskResp struct {
+	task AssignedTask
+	err  error
+}
 
-			// Rollback the Op1.
-			c.state.workerFiniteSet.workers = c.state.workerFiniteSet.workers[0 : len(c.state.workerFiniteSet.workers)-1]
-			c.state.workerFiniteSet.numWorkers--
-			resp.profile = WorkerProfile{}
-			resp.err = fmt.Errorf("no task to assign now")
+func (c *Coordinator) scheduleTask(req scheduleTaskReq) scheduleTaskResp {
+	respChan := make(chan scheduleTaskResp, 1)
+
+	c.stateOpChan <- func() {
+		resp := scheduleTaskResp{}
+
+		if c.state.workerFiniteSet.workers[req.profile.ID].livenessStatus == Dead {
+			// Scheduling failure condition 1:
+			log.Println("<Error> State manager: Failed to assign a task because worker is dead")
+			resp.err = fmt.Errorf("worker is dead")
 
 			respChan <- resp
 			return
 		}
 
-		w := c.state.workerFiniteSet.workers[resp.profile.ID]
+		if !c.state.taskFiniteSet.mapPhaseIsCompleted {
+			if len(c.state.idleTaskQueue.mapTaskQueue) == 0 {
+				// Scheduling failure conditon 2:
+				log.Println("<Error> State manager: Failed to assign a task because there is no idle map task")
+				resp.err = fmt.Errorf("no map task to assign now")
+				respChan <- resp
+				return
+			}
 
-		enqueuedTask := c.state.idleTaskQueue.q[0]
-		c.state.idleTaskQueue.q = c.state.idleTaskQueue.q[1:]
+		} else if c.state.taskFiniteSet.mapPhaseIsCompleted && !c.state.taskFiniteSet.reducePhaseIsCompleted {
+			if len(c.state.idleTaskQueue.reduceTaskQueue) == 0 {
+				// Scheduling failure conditon 3:
+				log.Println("<Error> State manager: Failed to assign a task because there is no idle reduce task")
+				resp.err = fmt.Errorf("no reduce task to assign now")
+				respChan <- resp
+				return
+			}
+		} else if c.state.taskFiniteSet.reducePhaseIsCompleted {
+			// Scheduling failure conditon 4:
+			log.Println("<Error> State manager: Failed to assign a task because all tasks are already completed")
+			resp.err = fmt.Errorf("all tasks are completed")
+			respChan <- resp
+			return
+		}
+
+		w := c.state.workerFiniteSet.workers[req.profile.ID]
+
+		var enqueuedTask *task
+
+		if !c.state.taskFiniteSet.mapPhaseIsCompleted {
+			enqueuedTask = c.state.idleTaskQueue.mapTaskQueue[0]
+			c.state.idleTaskQueue.mapTaskQueue = c.state.idleTaskQueue.mapTaskQueue[1:]
+		} else {
+			enqueuedTask = c.state.idleTaskQueue.reduceTaskQueue[0]
+			c.state.idleTaskQueue.reduceTaskQueue = c.state.idleTaskQueue.reduceTaskQueue[1:]
+		}
 
 		enqueuedTask.progressionStatus = Pending
 		enqueuedTask.scheduledWith = w
@@ -309,9 +394,8 @@ func (c *Coordinator) scheduleTask() scheduleTaskResp {
 
 		resp.task = assignedTask
 
-		log.Printf("<INFO> State manager: Worker %d is initialized\n", resp.profile.ID)
 		log.Printf("<INFO> State manager: %s task %d is scheduled with the worker %d\n",
-			TaskClassToString(resp.task.Class), resp.task.Seq, resp.profile.ID)
+			TaskClassToString(resp.task.Class), resp.task.Seq, req.profile.ID)
 
 		respChan <- resp
 	}
@@ -354,6 +438,57 @@ func (c *Coordinator) prepareInputPaths(req prepareInputPathsReq) prepareInputPa
 		c.stateOpChan <- func() {
 
 		}
+
+	}
+
+	return <-respChan
+}
+
+type updateByCommitReq struct {
+	profile    WorkerProfile
+	task       AssignedTask
+	outputPath []string
+}
+
+type updateByCommitResp struct {
+	err error
+}
+
+func (c *Coordinator) updateByCommit(req updateByCommitReq) updateByCommitResp {
+	respChan := make(chan updateByCommitResp)
+
+	c.stateOpChan <- func() {
+		var task *task
+
+		if req.task.Class == Map {
+			task = c.state.taskFiniteSet.mapTasks[req.task.Seq]
+		} else {
+			task = c.state.taskFiniteSet.reduceTasks[req.task.Seq]
+		}
+
+		// 1. Update the state of a task.
+
+		// Deduplicate concurrent commits for the same task.
+		if task.scheduledWith.id != req.profile.ID {
+			log.Printf("<ERROR> State manager: Commit for %v task %v is duplicated\n", TaskClassToString(task.class), task.seq)
+			respChan <- updateByCommitResp{
+				err: fmt.Errorf("duplicated commit for %v task %v", TaskClassToString(task.class), task.seq),
+			}
+			return
+		}
+
+		task.progressionStatus = Completed
+		task.outputPath = req.outputPath
+		task.isCompleted = true
+
+		log.Printf("<INFO> State manager: %v task %v is completed by worker %v\n", TaskClassToString(task.class), task.seq, req.profile.ID)
+		// 2. Scan the state of all tasks for checking whether all tasks are completed
+		if task.class == Map {
+			c.completeMapPhase()
+		} else {
+			c.completeReducePhase()
+		}
+		respChan <- updateByCommitResp{err: nil}
 
 	}
 
@@ -461,14 +596,25 @@ func (cs *CoordinatorServer) stop() {
 	}
 }
 
+func (cs *CoordinatorServer) Connect(args ConnectArgs, reply *ConnectReply) error {
+	resp := cs.coord.assignWorker()
+
+	if resp.err != nil {
+		return fmt.Errorf("RPC call: CoordinatorService.Connect: %v", resp.err)
+	}
+
+	reply.Profile = resp.profile
+
+	return nil
+}
+
 func (cs *CoordinatorServer) Schedule(args ScheduleArgs, reply *ScheduleReply) error {
-	resp := cs.coord.scheduleTask()
+	resp := cs.coord.scheduleTask(scheduleTaskReq{args.Profile})
 
 	if resp.err != nil {
 		return fmt.Errorf("RPC call: CoordinatorService.Schedule: %v", resp.err)
 	}
 
-	reply.Profile = resp.profile
 	reply.Task = resp.task
 
 	return nil
@@ -486,6 +632,19 @@ func (cs *CoordinatorServer) FetchInputPath(args FetchInputPathArgs, reply *Fetc
 	}
 
 	reply.InputPaths = resp.inputPaths
+
+	return nil
+}
+
+func (cs *CoordinatorServer) CommitOutput(args CommitOutputArgs, reply *CommitOutputReply) error {
+	resp := cs.coord.updateByCommit(updateByCommitReq{
+		profile: args.Profile,
+		task:    args.Task,
+	})
+
+	if resp.err != nil {
+		return fmt.Errorf("RPC call: CoordinatorService.CommitOutput: %v", resp.err)
+	}
 
 	return nil
 }
@@ -604,7 +763,8 @@ func MakeCoordinator(files []string, nReduce int) {
 				workers: make([]*worker, 0),
 			},
 			idleTaskQueue: taskQueue{
-				q: make([]*task, 0),
+				mapTaskQueue:    make([]*task, 0),
+				reduceTaskQueue: make([]*task, 0),
 			},
 		},
 		stateOpChan: make(chan func(), 100),
@@ -620,7 +780,7 @@ func MakeCoordinator(files []string, nReduce int) {
 
 		c.state.taskFiniteSet.mapTasks[i] = mt
 
-		c.state.idleTaskQueue.q = append(c.state.idleTaskQueue.q, mt)
+		c.state.idleTaskQueue.mapTaskQueue = append(c.state.idleTaskQueue.mapTaskQueue, mt)
 	}
 
 	for i := 0; i < c.state.taskFiniteSet.reduceTasksToComplete; i++ {
@@ -633,7 +793,7 @@ func MakeCoordinator(files []string, nReduce int) {
 
 		c.state.taskFiniteSet.reduceTasks[i] = rt
 
-		// c.state.idleTaskQueue.q = append(c.state.idleTaskQueue.q, rt)
+		c.state.idleTaskQueue.reduceTaskQueue = append(c.state.idleTaskQueue.reduceTaskQueue, rt)
 	}
 
 	c.coordinatorServer = &CoordinatorServer{

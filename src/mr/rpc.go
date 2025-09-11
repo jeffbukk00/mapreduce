@@ -15,8 +15,10 @@ const (
 )
 
 const (
+	CoordinatorConnect        = "CoordinatorService.Connect"
 	CoordinatorSchedule       = "CoordinatorService.Schedule"
 	CoordinatorFetchInputPath = "CoordinatorService.FetchInputPath"
+	coordinatorCommitoutput   = "CoordinatorService.CommitOutput"
 )
 
 const (
@@ -28,14 +30,22 @@ const (
 // Args and reply type definitions for general RPC methods
 // ------------------------
 
-// ScheduleArgs is an argument type of RPC method "CoordinatorService.Schedule"
-type ScheduleArgs struct {
+// ConnectArgs is an argument type of RPC method "CoordinatorService.Connect"
+type ConnectArgs struct{}
+
+// ConnectReply is a return type of RPC method "CoordinatorService.Connect"
+type ConnectReply struct {
+	Profile WorkerProfile
 }
 
-// ScheduleReply is an return type of RPC method "CoordinatorService.Schedule"
-type ScheduleReply struct {
+// ScheduleArgs is an argument type of RPC method "CoordinatorService.Schedule"
+type ScheduleArgs struct {
 	Profile WorkerProfile
-	Task    AssignedTask
+}
+
+// ScheduleReply is a return type of RPC method "CoordinatorService.Schedule"
+type ScheduleReply struct {
+	Task AssignedTask
 }
 
 // FetchInputPathArgs is an argument type of RPC method "CoordinatorService.FetchInputPath"
@@ -45,10 +55,20 @@ type FetchInputPathArgs struct {
 	WhatToFetch []int
 }
 
-// FetchInputPathReply is an return type of RPC method "CoordinatorService.FetchInputPath"
+// FetchInputPathReply is a return type of RPC method "CoordinatorService.FetchInputPath"
 type FetchInputPathReply struct {
 	InputPaths []Input
 }
+
+// CommitOutputArgs is an argument type of RPC method "CoordinatorService.CommitOutput"
+type CommitOutputArgs struct {
+	Profile    WorkerProfile
+	Task       AssignedTask
+	OutputPath []string
+}
+
+// CommitOutputReply is a return type of RPC method "CoordinatorService.CommitOutput"
+type CommitOutputReply struct{}
 
 // ------------------------
 // Args and reply type definitions for signaling
@@ -59,7 +79,7 @@ type PingArgs struct {
 	WorkerID int
 }
 
-// PingReply is an return type of RPC method "SignalService.Ping"
+// PingReply is a return type of RPC method "SignalService.Ping"
 type PingReply struct {
 	Resp PingResponse
 }

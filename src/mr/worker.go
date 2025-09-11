@@ -18,7 +18,8 @@ import (
 type executionStage int
 
 const (
-	StageSchedule executionStage = iota
+	StageConnect executionStage = iota
+	StageSchedule
 	StageFetchInputPath
 	StageShuffle
 	StageProgressTask
@@ -126,9 +127,6 @@ type WorkerProfile struct {
 type workerState struct {
 	profile WorkerProfile
 	task    AssignedTask
-
-	mapf    mapFunc
-	reducef reduceFunc
 }
 
 /*
@@ -146,6 +144,9 @@ type workerState struct {
 // It holds references to these threads and broadcasts updates to them as needed.
 type Worker struct {
 	state workerState
+
+	mapf    mapFunc
+	reducef reduceFunc
 
 	stateOpChan chan func()
 
@@ -285,7 +286,7 @@ func (w *Worker) getMapFunc() getMapFuncResp {
 		make(chan getMapFuncResp)
 
 	w.stateOpChan <- func() {
-		respChan <- getMapFuncResp{mapFunc: w.state.mapf}
+		respChan <- getMapFuncResp{mapFunc: w.mapf}
 	}
 
 	return <-respChan
@@ -301,11 +302,28 @@ func (w *Worker) getReduceFunc() getReduceFuncResp {
 
 	w.stateOpChan <- func() {
 		respChan <- getReduceFuncResp{
-			reduceFunc: w.state.reducef,
+			reduceFunc: w.reducef,
 		}
 	}
 
 	return <-respChan
+}
+
+func (w *Worker) clearTask() {
+	done := make(chan struct{})
+
+	w.stateOpChan <- func() {
+		profile := w.state.profile
+
+		w.state = workerState{
+			profile: profile,
+			task:    AssignedTask{},
+		}
+
+		close(done)
+	}
+
+	<-done
 }
 
 // ------------------------
@@ -321,11 +339,12 @@ func (w *Worker) getReduceFunc() getReduceFuncResp {
 */
 // ExecutionLoop loops a sequence of execution stages in strict order.
 type executionLoop struct {
-	stage executionStage
-
+	stage     executionStage
 	stageChan chan executionStage
 
 	inputFetcher inputFetchTracker
+
+	outputPath []string
 
 	w *Worker
 
@@ -369,28 +388,37 @@ func (el *executionLoop) startLoop() {
 
 	var e executionStage
 
-	el.stageChan <- StageSchedule
+	el.stageChan <- StageConnect
 
 	for e = range el.stageChan {
 
 		el.stage = e
 
 		switch e {
+		case StageConnect:
+			log.Println("<INFO> Execution loop: Is at the Connect stage")
+			el.connect()
+			time.Sleep(2 * time.Second)
 		case StageSchedule:
 			log.Println("<INFO> Execution loop: Is at the Schedule stage")
 			el.schedule()
+			time.Sleep(2 * time.Second)
 		case StageFetchInputPath:
 			log.Println("<INFO> Execution loop: Is at the FetchInputPath stage")
 			el.fetchInputPath()
+			time.Sleep(2 * time.Second)
 		case StageShuffle:
 			log.Println("<INFO> Execution loop: Is at the Shuffle stage")
 			el.shuffle()
+			time.Sleep(2 * time.Second)
 		case StageProgressTask:
 			log.Println("<INFO> Execution loop: Is at the ProgressTask stage")
 			el.processTask()
+			time.Sleep(2 * time.Second)
 		case StageCommitOutput:
 			log.Println("<INFO> Execution loop: Is at the CommitOutput stage")
 			el.commitOutput()
+			time.Sleep(2 * time.Second)
 		case StageTerminateLoop:
 			log.Println("<INFO> Execution loop: Is at the TerminateLoop stage")
 			close(el.stageChan) // Propagate a termination.
@@ -400,16 +428,16 @@ func (el *executionLoop) startLoop() {
 	log.Println("<INFO> Execution loop: Stop to loop")
 }
 
-func (el *executionLoop) schedule() {
-	args := ScheduleArgs{}
-	reply := ScheduleReply{}
+func (el *executionLoop) connect() {
+	args := ConnectArgs{}
+	reply := ConnectReply{}
 
-	err := el.call(CoordinatorSchedule, &args, &reply)
+	err := el.call(CoordinatorConnect, &args, &reply)
 
 	if err != nil {
-		log.Printf("<ERROR> Execution loop: Failed to schedule: %v\n", err)
+		log.Printf("<ERROR> Execution loop: Failed to connect: %v\n", err)
 		// Retry
-		el.stageChan <- StageSchedule
+		el.stageChan <- StageConnect
 		return
 	}
 
@@ -421,6 +449,26 @@ func (el *executionLoop) schedule() {
 
 	log.Printf("<INFO> Execution loop: Worker %d is Connected", reply.Profile.ID)
 
+	el.stageChan <- StageSchedule
+}
+
+func (el *executionLoop) schedule() {
+	args := ScheduleArgs{}
+	reply := ScheduleReply{}
+
+	args.Profile = el.w.getWorkerProfile().profile
+
+	err := el.call(CoordinatorSchedule, &args, &reply)
+
+	if err != nil {
+		log.Printf("<ERROR> Execution loop: Failed to schedule: %v\n", err)
+		// Backoff
+		time.Sleep(time.Second * 5)
+		// Retry
+		el.stageChan <- StageSchedule
+		return
+	}
+
 	el.w.assignTask(assignTaskReq{task: reply.Task})
 
 	log.Printf("<INFO> Execution loop: %s task %d is scheduled\n", TaskClassToString(reply.Task.Class), reply.Task.Seq)
@@ -431,6 +479,12 @@ func (el *executionLoop) schedule() {
 func (el *executionLoop) fetchInputPath() {
 	p := el.w.getWorkerProfile().profile
 	t := el.w.getTask().task
+
+	// Breakpoint:
+	if t.Class == Reduce {
+		log.Println("<BREAKPOINT>")
+		time.Sleep(120 * time.Second)
+	}
 
 	if !el.inputFetcher.isInit {
 		// Initialize once per a task
@@ -476,7 +530,7 @@ func (el *executionLoop) shuffle() {
 	t := el.w.getTask().task
 
 	// Local file reader for an input of a map task.
-	read := func(path string, seq int, inputIdx int) {
+	read := func(path string, inputIdx int) {
 		file, err := os.Open(path)
 		if err != nil {
 			log.Fatalf("<FATAL> Non-recoverable error from local file open: %v", err)
@@ -490,7 +544,7 @@ func (el *executionLoop) shuffle() {
 			log.Fatalf("<FATAL> Non-recoverable error from local file read: %v", err)
 		}
 
-		log.Printf("<INFO> Fetched: %s\n", string(content[:50]))
+		log.Printf("<INFO> Execution loop: Fetched: %s\n", string(content[:50]))
 		// Loads a fetched input to the memory.
 		el.inputFetcher.fetchedInputs[inputIdx] = string(content)
 	}
@@ -515,7 +569,7 @@ func (el *executionLoop) shuffle() {
 			log.Printf("<INFO> Execution loop: Try to read %s for a %s task %d\n", path,
 				TaskClassToString(t.Class), t.Seq)
 
-			read(path, t.Seq, v)
+			read(path, v)
 
 			/*
 				<Retrying mechanism on fetching from asynchronous network>
@@ -568,7 +622,6 @@ func (el *executionLoop) processTask() {
 	}
 
 	setContextForMapTaskExec := func(mapFunc mapFunc) {
-
 		// Single input for a map task
 		inputFilename := el.inputFetcher.inputFetchState[0].Path
 		content := el.inputFetcher.fetchedInputs[0]
@@ -581,6 +634,7 @@ func (el *executionLoop) processTask() {
 
 		numPartitions := t.NumOutputs
 		partitions := make([][]KeyValue, t.NumOutputs)
+		el.outputPath = make([]string, numPartitions)
 
 		for _, v := range output {
 			hash := ihash(v.Key)
@@ -596,7 +650,10 @@ func (el *executionLoop) processTask() {
 		for i, v := range partitions {
 			sort.Sort(ByKey(v)) // Ordering is guaranteed per a partition.
 
-			write(getOutputFilename(i), v)
+			outputPath := getOutputFilename(i)
+			el.outputPath[i] = outputPath
+
+			write(outputPath, v)
 		}
 	}
 
@@ -617,12 +674,33 @@ func (el *executionLoop) processTask() {
 }
 
 func (el *executionLoop) commitOutput() {
-	log.Println("<BREAKPOINT>")
-	time.Sleep(time.Second * 30) // Breakpoint: for testing the execution loop.
+	w := el.w.getWorkerProfile().profile
+	t := el.w.getTask().task
+
+	args := CommitOutputArgs{
+		Profile:    w,
+		Task:       t,
+		OutputPath: el.outputPath,
+	}
+
+	reply := CommitOutputReply{}
+
+	err := el.call(coordinatorCommitoutput, &args, &reply)
+
+	if err != nil {
+		log.Printf("<ERROR> Execution loop: Failed to : %v\n", err)
+		// Retry
+		el.stageChan <- StageCommitOutput
+		return
+	}
+
 	// Required: Clear up prior task's context.
+	el.w.clearTask() // Clear the current task.
+
+	el.inputFetcher = inputFetchTracker{} // Clear the input state.
+	el.outputPath = nil
 
 	el.stageChan <- StageSchedule // Loop. Return to StageSchedule.
-
 }
 
 func (el *executionLoop) quitLoop() {
@@ -697,8 +775,9 @@ func (sh *signalHandler) call(rpcname string, args interface{}, reply interface{
 }
 
 func (sh *signalHandler) sendPing() {
+	w := sh.w.getWorkerProfile().profile
 
-	if !sh.w.state.profile.IsAssigned {
+	if !w.IsAssigned {
 		// Backoff: Cannot send a ping if the coordinator cannot identify this worker yet.
 		log.Println("<ERROR> Signal handler: Cannot send a ping if worker profile is not assigned from the coordinator yet.")
 		return
@@ -707,7 +786,7 @@ func (sh *signalHandler) sendPing() {
 	args := PingArgs{}
 	reply := PingReply{}
 
-	args.WorkerID = sh.w.getWorkerProfile().profile.ID
+	args.WorkerID = w.ID
 
 	log.Println("<INFO> Signal handler: Try to send a ping to the coordinator")
 
@@ -716,7 +795,7 @@ func (sh *signalHandler) sendPing() {
 	// Unexpected errors specific to RPC call internal.
 	// Not related with ping response types.
 	if err != nil {
-		log.Printf("<ERROR> Signal handler: Failed to send a ping to the coordinator / %v", err)
+		log.Fatalf("<FATAL> Signal handler: Failed to send a ping to the coordinator / %v", err)
 		return
 	}
 
@@ -834,10 +913,8 @@ func MakeWorker(mapf mapFunc, reducef reduceFunc) {
 	log.SetPrefix(prefix)
 
 	w := Worker{
-		state: workerState{
-			mapf:    mapf,
-			reducef: reducef,
-		},
+		mapf:    mapf,
+		reducef: reducef,
 
 		stateOpChan: make(chan func(), 100),
 	}
