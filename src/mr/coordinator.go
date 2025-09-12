@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
-	"strconv"
 	"time"
 )
 
@@ -40,12 +39,10 @@ type task struct {
 	seq               int
 	progressionStatus taskProgressionStatus
 
-	// For map tasks, this is an actual input file path.
-	// For reduce tasks, this is a partition id. Concatenated string(map task X's outputPath + reduce task Y's inputPath)
-	// can be an actual input file path for single partition of reduce task Y.
-	inputPath string
+	inputFilenameForMapTask   string
+	partitionNumForReduceTask int
 
-	outputPath []string
+	outputPath []Path
 
 	scheduledWith *worker
 
@@ -215,6 +212,7 @@ func (c *Coordinator) DetectWorkerFailure(detectionPoint time.Time) {
 				t.progressionStatus = Idle
 				t.outputPath = nil
 				t.scheduledWith = nil
+				t.isCompleted = false
 
 				if t.class == Map {
 					c.state.idleTaskQueue.mapTaskQueue = append(c.state.idleTaskQueue.mapTaskQueue, t)
@@ -269,12 +267,29 @@ func (c *Coordinator) updateLastPing(req updateLastPingReq) {
 
 		c.state.workerFiniteSet.workers[req.id].lastPing = time.Now()
 
-		log.Printf("<INFO> State manaer: Renew the lifetime of worker %d\n", req.id)
+		log.Printf("<INFO> State manager: Renew the lifetime of worker %d\n", req.id)
 
-		done <- struct{}{}
+		close(done)
 	}
 
 	<-done
+}
+
+type isReducePhaseCompletedResp struct {
+	isCompleted bool
+}
+
+func (c *Coordinator) isReducePhaseComplete() isReducePhaseCompletedResp {
+	respChan := make(chan isReducePhaseCompletedResp)
+
+	c.stateOpChan <- func() {
+		respChan <- isReducePhaseCompletedResp{
+			isCompleted: c.state.taskFiniteSet.reducePhaseIsCompleted,
+		}
+
+	}
+
+	return <-respChan
 }
 
 type assignWorkerResp struct {
@@ -338,7 +353,7 @@ func (c *Coordinator) scheduleTask(req scheduleTaskReq) scheduleTaskResp {
 		if !c.state.taskFiniteSet.mapPhaseIsCompleted {
 			if len(c.state.idleTaskQueue.mapTaskQueue) == 0 {
 				// Scheduling failure conditon 2:
-				log.Println("<Error> State manager: Failed to assign a task because there is no idle map task")
+				log.Println("<ERROR> State manager: Failed to assign a task because there is no idle map task")
 				resp.err = fmt.Errorf("no map task to assign now")
 				respChan <- resp
 				return
@@ -347,14 +362,14 @@ func (c *Coordinator) scheduleTask(req scheduleTaskReq) scheduleTaskResp {
 		} else if c.state.taskFiniteSet.mapPhaseIsCompleted && !c.state.taskFiniteSet.reducePhaseIsCompleted {
 			if len(c.state.idleTaskQueue.reduceTaskQueue) == 0 {
 				// Scheduling failure conditon 3:
-				log.Println("<Error> State manager: Failed to assign a task because there is no idle reduce task")
+				log.Println("<ERROR> State manager: Failed to assign a task because there is no idle reduce task")
 				resp.err = fmt.Errorf("no reduce task to assign now")
 				respChan <- resp
 				return
 			}
 		} else if c.state.taskFiniteSet.reducePhaseIsCompleted {
 			// Scheduling failure conditon 4:
-			log.Println("<Error> State manager: Failed to assign a task because all tasks are already completed")
+			log.Println("<ERROR> State manager: Failed to assign a task because all tasks are already completed")
 			resp.err = fmt.Errorf("all tasks are completed")
 			respChan <- resp
 			return
@@ -410,7 +425,7 @@ type prepareInputPathsReq struct {
 }
 
 type prepareInputPathsResp struct {
-	inputPaths []Input
+	inputPaths []Path
 	err        error
 }
 
@@ -422,10 +437,12 @@ func (c *Coordinator) prepareInputPaths(req prepareInputPathsReq) prepareInputPa
 		c.stateOpChan <- func() {
 			task := c.state.taskFiniteSet.mapTasks[req.task.Seq]
 
-			inputPaths := make([]Input, 1)
+			inputPaths := make([]Path, 1)
 
-			inputPaths[0] = Input{
-				Path: task.inputPath,
+			inputPaths[0] = Path{
+				IsInit:   true,
+				Addr:     "",
+				Filename: task.inputFilenameForMapTask,
 			}
 
 			respChan <- prepareInputPathsResp{
@@ -436,7 +453,23 @@ func (c *Coordinator) prepareInputPaths(req prepareInputPathsReq) prepareInputPa
 	} else {
 		// Prepare input paths for a reduce task.
 		c.stateOpChan <- func() {
+			inputPaths := make([]Path, len(req.whatToFetch))
 
+			p := c.state.taskFiniteSet.reduceTasks[req.task.Seq].partitionNumForReduceTask
+
+			for i, v := range req.whatToFetch {
+				t := c.state.taskFiniteSet.mapTasks[v]
+				if t.outputPath == nil {
+					inputPaths[i] = Path{IsInit: false}
+					continue
+				}
+
+				inputPaths[i] = t.outputPath[p]
+			}
+
+			respChan <- prepareInputPathsResp{
+				inputPaths: inputPaths,
+			}
 		}
 
 	}
@@ -447,7 +480,7 @@ func (c *Coordinator) prepareInputPaths(req prepareInputPathsReq) prepareInputPa
 type updateByCommitReq struct {
 	profile    WorkerProfile
 	task       AssignedTask
-	outputPath []string
+	outputPath []Path
 }
 
 type updateByCommitResp struct {
@@ -486,6 +519,7 @@ func (c *Coordinator) updateByCommit(req updateByCommitReq) updateByCommitResp {
 		if task.class == Map {
 			c.completeMapPhase()
 		} else {
+
 			c.completeReducePhase()
 		}
 		respChan <- updateByCommitResp{err: nil}
@@ -576,7 +610,6 @@ func (cs *CoordinatorServer) start() {
 }
 
 func (cs *CoordinatorServer) stop() {
-	log.Println("<INFO> Coordinator server: Shutting down coordinator server...")
 	// *http.Server.Shutdown():
 	// 1. The server stops accepting new connections.
 	// 2. Idle connections are closed.
@@ -638,8 +671,9 @@ func (cs *CoordinatorServer) FetchInputPath(args FetchInputPathArgs, reply *Fetc
 
 func (cs *CoordinatorServer) CommitOutput(args CommitOutputArgs, reply *CommitOutputReply) error {
 	resp := cs.coord.updateByCommit(updateByCommitReq{
-		profile: args.Profile,
-		task:    args.Task,
+		profile:    args.Profile,
+		task:       args.Task,
+		outputPath: args.OutputPath,
 	})
 
 	if resp.err != nil {
@@ -706,6 +740,8 @@ type workerScanner struct {
 func (ws *workerScanner) run() {
 	defer ws.barrierWithParent.DoneSig()
 
+	ws.wScannerLoopDone = make(chan struct{})
+
 	log.Println("<INFO> Worker scanner: Intialized")
 
 	ws.barrierWithParent.ReadySig()
@@ -722,10 +758,10 @@ func (ws *workerScanner) startWorkerScanner() {
 	for {
 		select {
 		case <-ticker.C:
-			startToDetectFailure := time.Now()
-			ws.coord.DetectWorkerFailure(startToDetectFailure)
-			durationToDetectFailure := time.Since(startToDetectFailure)
-			log.Printf("<INFO> Worker scanner: Worker scanning took %v\n", durationToDetectFailure)
+			if !ws.coord.isReducePhaseComplete().isCompleted {
+				ws.coord.DetectWorkerFailure(time.Now())
+			}
+
 		case <-ws.wScannerLoopDone:
 			log.Println("<INFO> Worker scanner: Quit the worker scanner loop")
 			return
@@ -734,6 +770,7 @@ func (ws *workerScanner) startWorkerScanner() {
 }
 
 func (ws *workerScanner) quitWorkerScanner() {
+
 	ws.wScannerLoopDone <- struct{}{}
 }
 
@@ -772,10 +809,10 @@ func MakeCoordinator(files []string, nReduce int) {
 
 	for i := 0; i < c.state.taskFiniteSet.mapTasksToComplete; i++ {
 		mt := &task{
-			class:             Map,
-			seq:               i,
-			progressionStatus: Idle,
-			inputPath:         files[i],
+			class:                   Map,
+			seq:                     i,
+			progressionStatus:       Idle,
+			inputFilenameForMapTask: files[i],
 		}
 
 		c.state.taskFiniteSet.mapTasks[i] = mt
@@ -785,10 +822,10 @@ func MakeCoordinator(files []string, nReduce int) {
 
 	for i := 0; i < c.state.taskFiniteSet.reduceTasksToComplete; i++ {
 		rt := &task{
-			class:             Reduce,
-			seq:               i,
-			progressionStatus: Idle,
-			inputPath:         strconv.Itoa(i),
+			class:                     Reduce,
+			seq:                       i,
+			progressionStatus:         Idle,
+			partitionNumForReduceTask: i,
 		}
 
 		c.state.taskFiniteSet.reduceTasks[i] = rt

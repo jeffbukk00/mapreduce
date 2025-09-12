@@ -1,10 +1,13 @@
 package mr
 
 import (
+	"context"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"log"
+	"net"
+	"net/http"
 	"net/rpc"
 	"os"
 	"sort"
@@ -101,17 +104,24 @@ type AssignedTask struct {
 	NumOutputs int
 }
 
+type Path struct {
+	IsInit   bool
+	Addr     string
+	Filename string
+}
+
 // Input is the fetching state for a dedicated path.
 type Input struct {
-	Path      string
+	Path      Path
 	IsFetched bool
 }
 
 type inputFetchTracker struct {
-	isInit          bool
-	inputFetchState []Input
-	whatToFetch     []int
-	fetchedInputs   []string
+	isInit                   bool
+	inputPathFetchRetryCount int
+	inputFetchState          []Input
+	whatToFetch              []int
+	fetchedInputs            [][]byte
 }
 
 // ------------------------
@@ -125,8 +135,10 @@ type WorkerProfile struct {
 }
 
 type workerState struct {
-	profile WorkerProfile
-	task    AssignedTask
+	profile           WorkerProfile
+	shuffleServerAddr string
+	task              AssignedTask
+	delayedTasks      []AssignedTask
 }
 
 /*
@@ -152,7 +164,7 @@ type Worker struct {
 
 	executionLoop *executionLoop
 	signalHandler *signalHandler
-	shuffleServer *shuffleServer
+	shuffleServer *ShuffleServer
 
 	barrierWithParent   *ThreadLifecycleBarrier
 	barrierWithChildren *ThreadLifecycleBarrier
@@ -199,7 +211,7 @@ func (w *Worker) terminate() {
 
 			go w.executionLoop.quitLoop()
 			go w.signalHandler.quitSignalHandler()
-			go w.shuffleServer.quitShuffleServer()
+			go w.shuffleServer.stop()
 
 			w.barrierWithChildren.Done()
 
@@ -260,6 +272,54 @@ func (w *Worker) getTask() getTaskResp {
 	return <-resp
 }
 
+type getDelayedTaskResp struct {
+	task   AssignedTask
+	isDone bool
+}
+
+func (w *Worker) getDelayedTask() getDelayedTaskResp {
+	resp := make(chan getDelayedTaskResp)
+
+	w.stateOpChan <- func() {
+		if len(w.state.delayedTasks) > 0 {
+			t := w.state.delayedTasks[0]
+			w.state.delayedTasks = w.state.delayedTasks[1:]
+			resp <- getDelayedTaskResp{
+				task:   t,
+				isDone: false,
+			}
+		} else {
+			resp <- getDelayedTaskResp{
+				isDone: true,
+			}
+		}
+
+	}
+
+	return <-resp
+}
+
+type pushDelayedTaskReq struct {
+	task AssignedTask
+}
+
+func (w *Worker) pushDelayedTask(req pushDelayedTaskReq) {
+	done := make(chan struct{})
+
+	w.stateOpChan <- func() {
+		if w.state.delayedTasks == nil {
+			w.state.delayedTasks = make([]AssignedTask, 1)
+			w.state.delayedTasks[0] = req.task
+		} else {
+			w.state.delayedTasks = append(w.state.delayedTasks, req.task)
+		}
+
+		close(done)
+	}
+
+	<-done
+}
+
 type assignTaskReq struct {
 	task AssignedTask
 }
@@ -309,16 +369,39 @@ func (w *Worker) getReduceFunc() getReduceFuncResp {
 	return <-respChan
 }
 
+func (w *Worker) pushAddr(addr string) {
+
+	w.stateOpChan <- func() {
+		w.state.shuffleServerAddr = addr
+
+	}
+
+}
+
+type getAddrResp struct {
+	addr string
+}
+
+func (w *Worker) getAddr() getAddrResp {
+	respChan := make(chan getAddrResp)
+
+	w.stateOpChan <- func() {
+		a := w.state.shuffleServerAddr
+
+		respChan <- getAddrResp{
+			addr: a,
+		}
+	}
+
+	return <-respChan
+}
+
 func (w *Worker) clearTask() {
 	done := make(chan struct{})
 
 	w.stateOpChan <- func() {
-		profile := w.state.profile
 
-		w.state = workerState{
-			profile: profile,
-			task:    AssignedTask{},
-		}
+		w.state.task = AssignedTask{}
 
 		close(done)
 	}
@@ -344,7 +427,7 @@ type executionLoop struct {
 
 	inputFetcher inputFetchTracker
 
-	outputPath []string
+	outputPath []Path
 
 	w *Worker
 
@@ -421,11 +504,26 @@ func (el *executionLoop) startLoop() {
 			time.Sleep(2 * time.Second)
 		case StageTerminateLoop:
 			log.Println("<INFO> Execution loop: Is at the TerminateLoop stage")
+
+		Drain:
+			for {
+				select {
+				case <-el.stageChan:
+				default:
+					break Drain
+				}
+			}
+
 			close(el.stageChan) // Propagate a termination.
 		}
 	}
 
 	log.Println("<INFO> Execution loop: Stop to loop")
+}
+
+func (el *executionLoop) clearInputState() {
+	el.inputFetcher = inputFetchTracker{} // Clear the input state.
+	el.outputPath = nil
 }
 
 func (el *executionLoop) connect() {
@@ -453,6 +551,8 @@ func (el *executionLoop) connect() {
 }
 
 func (el *executionLoop) schedule() {
+	var assignedTask AssignedTask
+
 	args := ScheduleArgs{}
 	reply := ScheduleReply{}
 
@@ -461,17 +561,25 @@ func (el *executionLoop) schedule() {
 	err := el.call(CoordinatorSchedule, &args, &reply)
 
 	if err != nil {
-		log.Printf("<ERROR> Execution loop: Failed to schedule: %v\n", err)
-		// Backoff
-		time.Sleep(time.Second * 5)
-		// Retry
-		el.stageChan <- StageSchedule
-		return
+		delayedTask := el.w.getDelayedTask()
+
+		if !delayedTask.isDone {
+			assignedTask = delayedTask.task
+		} else {
+			log.Printf("<ERROR> Execution loop: Failed to schedule: %v\n", err)
+			// Backoff
+			time.Sleep(time.Second * 5)
+			// Retry
+			el.stageChan <- StageSchedule
+			return
+		}
+	} else {
+		assignedTask = reply.Task
 	}
 
-	el.w.assignTask(assignTaskReq{task: reply.Task})
+	el.w.assignTask(assignTaskReq{task: assignedTask})
 
-	log.Printf("<INFO> Execution loop: %s task %d is scheduled\n", TaskClassToString(reply.Task.Class), reply.Task.Seq)
+	log.Printf("<INFO> Execution loop: %s task %d is scheduled\n", TaskClassToString(assignedTask.Class), assignedTask.Seq)
 
 	el.stageChan <- StageFetchInputPath
 }
@@ -480,16 +588,10 @@ func (el *executionLoop) fetchInputPath() {
 	p := el.w.getWorkerProfile().profile
 	t := el.w.getTask().task
 
-	// Breakpoint:
-	if t.Class == Reduce {
-		log.Println("<BREAKPOINT>")
-		time.Sleep(120 * time.Second)
-	}
-
 	if !el.inputFetcher.isInit {
 		// Initialize once per a task
 		el.inputFetcher.inputFetchState = make([]Input, t.NumInputs)
-		el.inputFetcher.fetchedInputs = make([]string, t.NumInputs)
+		el.inputFetcher.fetchedInputs = make([][]byte, t.NumInputs)
 		el.inputFetcher.whatToFetch = make([]int, 0)
 
 		for i := range el.inputFetcher.inputFetchState {
@@ -497,6 +599,19 @@ func (el *executionLoop) fetchInputPath() {
 		}
 
 		el.inputFetcher.isInit = true
+	} else {
+		if el.inputFetcher.inputPathFetchRetryCount == MaxRetryWhileInputPathFetching {
+			el.w.pushDelayedTask(pushDelayedTaskReq{task: t})
+			log.Printf("<INFO> Execution loop: %v task %v is delayed", TaskClassToString(t.Class), t.Seq)
+			el.w.clearTask()
+			el.clearInputState()
+			log.Printf("<ERROR> Execution loop: Failed to fetch inputs; Return to Schedule stage")
+			el.stageChan <- StageSchedule
+			return
+		}
+		el.inputFetcher.inputPathFetchRetryCount++
+		log.Printf("<ERROR> Execution loop: Retried to fetch input paths %v times for %v task %v\n",
+			el.inputFetcher.inputPathFetchRetryCount, TaskClassToString(t.Class), t.Seq)
 	}
 
 	args := FetchInputPathArgs{
@@ -517,8 +632,9 @@ func (el *executionLoop) fetchInputPath() {
 	}
 
 	for i, v := range el.inputFetcher.whatToFetch {
-		el.inputFetcher.inputFetchState[v] = reply.InputPaths[i]
-		log.Printf("<INFO> Execution loop: Fetched input path: %s\n", reply.InputPaths[i].Path)
+		p := reply.InputPaths[i]
+		el.inputFetcher.inputFetchState[v].Path = p
+
 	}
 
 	log.Println("<INFO> Execution loop: Input paths are fetched")
@@ -528,10 +644,11 @@ func (el *executionLoop) fetchInputPath() {
 
 func (el *executionLoop) shuffle() {
 	t := el.w.getTask().task
+	addr := el.w.getAddr().addr
 
 	// Local file reader for an input of a map task.
-	read := func(path string, inputIdx int) {
-		file, err := os.Open(path)
+	read := func(filename string, inputIdx int) {
+		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("<FATAL> Non-recoverable error from local file open: %v", err)
 		}
@@ -544,15 +661,53 @@ func (el *executionLoop) shuffle() {
 			log.Fatalf("<FATAL> Non-recoverable error from local file read: %v", err)
 		}
 
-		log.Printf("<INFO> Execution loop: Fetched: %s\n", string(content[:50]))
+		log.Printf("<INFO> Execution loop: Fetched %v bytes for a %v task %v from %v\n",
+			len(content), TaskClassToString(t.Class), t.Seq, filename)
 		// Loads a fetched input to the memory.
-		el.inputFetcher.fetchedInputs[inputIdx] = string(content)
+		el.inputFetcher.fetchedInputs[inputIdx] = content
 	}
 
 	// // Remote fetcher for inputs of a reduce task from other.
-	// fetch := func() (int, error) {
-	// 	// Define its own failure detection policy.(ex. "3 retry and 5s timeout per a try")
-	// }
+	fetch := func(path Path, inputIdx int, offset int64, size int) (int64, bool, error) {
+
+		c, err := rpc.DialHTTPPath("unix", path.Addr, "/rpc")
+
+		if err != nil {
+			return offset, false, fmt.Errorf("failed to connect to %v: %v", path.Addr, err)
+		}
+		defer c.Close()
+
+		args := FetchForShuffleArgs{
+			Filename: path.Filename,
+			Offset:   offset,
+			Size:     size,
+		}
+
+		reply := &FetchForShuffleReply{}
+
+		done := make(chan error, 1)
+
+		go func() {
+			done <- c.Call(ShuffleFetch, args, reply)
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				return offset, false, fmt.Errorf("failed to fetch from  %v, %v: %v", path.Addr, path.Filename, err)
+			}
+		case <-time.After(MaxTimerWhileShuffleFetching * time.Second):
+			return offset, false, fmt.Errorf("failed to fetch from  %v, %v: timeout", path.Addr, path.Filename)
+		}
+
+		el.inputFetcher.fetchedInputs[inputIdx] = append(el.inputFetcher.fetchedInputs[inputIdx], reply.Data...)
+
+		if reply.EOF {
+			return reply.Offset, true, nil
+		}
+
+		return reply.Offset, false, nil
+	}
 
 	wg := sync.WaitGroup{}
 
@@ -561,27 +716,52 @@ func (el *executionLoop) shuffle() {
 	for _, v := range el.inputFetcher.whatToFetch {
 
 		path := el.inputFetcher.inputFetchState[v].Path
+		if !path.IsInit {
+			log.Printf("<ERROR> Execution loop: Failed to fetch input %v; Path is not initialized", v)
+			whatToFetch = append(whatToFetch, v)
+			continue
+		}
+
 		wg.Add(1)
 
-		go func() {
-			defer wg.Done()
+		if path.Addr == "" || path.Addr == addr {
+			go func() {
+				defer wg.Done()
 
-			log.Printf("<INFO> Execution loop: Try to read %s for a %s task %d\n", path,
-				TaskClassToString(t.Class), t.Seq)
+				read(path.Filename, v)
+			}()
+		} else {
+			go func() {
+				defer wg.Done()
 
-			read(path, v)
+				var offset int64 = 0
+				size := 16 * 1024
+				isDone := false
+				retry := 0
 
-			/*
-				<Retrying mechanism on fetching from asynchronous network>
-				unfetchedInput, err := fetch()
+				for !isDone && retry < MaxRetryWhileShuffleFetching {
+					o, flag, err := fetch(path, v, offset, size)
 
-				if unfetchedInput >= 0 && err != nil {
+					offset = o
+					isDone = flag
 
-					log.Printf("<ERROR> Execution loop: %v\n", err)
-					whatToFetch = append(whatToFetch, unfetchedInput)
+					if err != nil {
+						retry++
+						log.Printf("<ERROR> Execution loop: Retried to fetch %v times for input %v: %v\n", retry, v, err)
+					}
+
 				}
-			*/
-		}()
+
+				if retry == MaxRetryWhileShuffleFetching {
+					log.Printf("<ERROR> Execution loop: Failed to fetch input %v\n", v)
+					whatToFetch = append(whatToFetch, v)
+				} else {
+					log.Printf("<INFO> Execution loop: Fetched %v bytes for a %v task %v from %v, %v\n",
+						offset, TaskClassToString(t.Class), t.Seq, path.Addr, path.Filename)
+				}
+
+			}()
+		}
 
 	}
 
@@ -589,6 +769,8 @@ func (el *executionLoop) shuffle() {
 
 	// If some fetches failed, return to StateFetchInputPath for retrying on only failed inputs/paths.
 	if len(whatToFetch) > 0 {
+		log.Printf("<ERROR> Execution loop: Failed to fetch %v inputs; Return to FetchInputPath stage\n", len(whatToFetch))
+		el.inputFetcher.whatToFetch = whatToFetch
 		el.stageChan <- StageFetchInputPath
 		return
 	}
@@ -602,12 +784,19 @@ func (el *executionLoop) shuffle() {
 func (el *executionLoop) processTask() {
 	w := el.w.getWorkerProfile().profile
 	t := el.w.getTask().task
+	addr := el.w.getAddr().addr
 
-	write := func(path string, listKV []KeyValue) {
+	// Breakpoint:
+	if t.Class == Reduce {
+		log.Println("<BREAKPOINT>")
+		time.Sleep(5 * time.Second)
+	}
+
+	write := func(filename string, listKV []KeyValue) {
 		// Writes to local FS.
-		file, err := os.Create(path)
+		file, err := os.Create(filename)
 		if err != nil {
-			log.Fatalf("<FATAL> Non-recoverable error from local file create: %s: %v", path, err)
+			log.Fatalf("<FATAL> Non-recoverable error from local file create: %v: %v", filename, err)
 		}
 		defer file.Close()
 
@@ -615,7 +804,7 @@ func (el *executionLoop) processTask() {
 			_, err := fmt.Fprintf(file, "%v %v\n", v.Key, v.Value)
 
 			if err != nil {
-				log.Fatalf("<FATAL> Non-recoverable error from local file write: %s: %v", path, err)
+				log.Fatalf("<FATAL> Non-recoverable error from local file write: %v: %v", filename, err)
 			}
 
 		}
@@ -623,8 +812,8 @@ func (el *executionLoop) processTask() {
 
 	setContextForMapTaskExec := func(mapFunc mapFunc) {
 		// Single input for a map task
-		inputFilename := el.inputFetcher.inputFetchState[0].Path
-		content := el.inputFetcher.fetchedInputs[0]
+		inputFilename := el.inputFetcher.inputFetchState[0].Path.Filename
+		content := string(el.inputFetcher.fetchedInputs[0])
 
 		output := mapFunc(inputFilename, content)
 
@@ -634,7 +823,7 @@ func (el *executionLoop) processTask() {
 
 		numPartitions := t.NumOutputs
 		partitions := make([][]KeyValue, t.NumOutputs)
-		el.outputPath = make([]string, numPartitions)
+		el.outputPath = make([]Path, numPartitions)
 
 		for _, v := range output {
 			hash := ihash(v.Key)
@@ -650,10 +839,14 @@ func (el *executionLoop) processTask() {
 		for i, v := range partitions {
 			sort.Sort(ByKey(v)) // Ordering is guaranteed per a partition.
 
-			outputPath := getOutputFilename(i)
-			el.outputPath[i] = outputPath
+			filename := getOutputFilename(i)
+			el.outputPath[i] = Path{
+				IsInit:   true,
+				Addr:     addr,
+				Filename: filename,
+			}
 
-			write(outputPath, v)
+			write(filename, v)
 		}
 	}
 
@@ -696,9 +889,7 @@ func (el *executionLoop) commitOutput() {
 
 	// Required: Clear up prior task's context.
 	el.w.clearTask() // Clear the current task.
-
-	el.inputFetcher = inputFetchTracker{} // Clear the input state.
-	el.outputPath = nil
+	el.clearInputState()
 
 	el.stageChan <- StageSchedule // Loop. Return to StageSchedule.
 }
@@ -872,31 +1063,147 @@ func (sh *signalHandler) notifyTerminationToStateManager() {
 // ------------------------
 // Type definitions for the shuffle server
 // ------------------------
-type shuffleServer struct {
+
+// ShuffleServer is an independent sender for fetching requests from other workers.
+// It serves intermidiate KV outputs from map tasks which are stored localy.
+type ShuffleServer struct {
 	w *Worker
 
-	isTerminated bool
+	rpcServer  *rpc.Server
+	httpServer *http.Server
+	listener   net.Listener
 
 	barrierWithParent *ThreadLifecycleBarrier
 }
 
-func (ss *shuffleServer) run() {
+func (ss *ShuffleServer) run() {
 	defer ss.barrierWithParent.DoneSig()
+
+	ss.server()
+	ss.w.pushAddr(ss.listener.Addr().String())
 
 	log.Println("<INFO> Shuffle server: Intialized")
 
 	ss.barrierWithParent.ReadySig()
 
-	for !ss.isTerminated {
-
-		time.Sleep(time.Second * 5)
-	}
+	ss.start()
 
 	log.Println("<INFO> Shuffle server: Terminated")
 }
 
-func (ss *shuffleServer) quitShuffleServer() {
-	ss.isTerminated = true
+func (ss *ShuffleServer) server() {
+	// Register RPC methods to an instance of RPC server.
+	rpcServer := rpc.NewServer()
+
+	if err := rpcServer.RegisterName(ShuffleService, ss); err != nil {
+		log.Fatalf("<FATAL> Shuffle server: Failed to register coordinator server RPC methods / %v\n", err)
+	}
+
+	// Create a custom HTTP mux and mount the RPC server
+	mux := http.NewServeMux()
+	mux.Handle("/rpc", rpcServer) // all RPC requests go to /rpc
+
+	sockname := ShuffleServerSock()
+	os.Remove(sockname)
+	addr := sockname
+
+	// Create the HTTP server instance
+	httpServer := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	// Register the lister on a TCP port
+	l, err := net.Listen("unix", addr)
+	if err != nil {
+		log.Fatalf("<FATAL> Shuffle server: Failed to register listener / %v\n", err)
+	}
+
+	ss.rpcServer = rpcServer
+	ss.httpServer = httpServer
+	ss.listener = l
+}
+
+func (ss *ShuffleServer) start() {
+
+	log.Println("<INFO> Shuffle server: Running on", ss.listener.Addr())
+	if err := ss.httpServer.Serve(ss.listener); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("<FATAL> Shuffle server: Failed to run HTTP server / %v\n", err)
+	}
+
+}
+
+func (ss *ShuffleServer) stop() {
+	log.Println("<INFO> Shuffle server: Shutting down shuffle server...")
+
+	ctx := context.Background()
+
+	if err := ss.httpServer.Shutdown(ctx); err != nil {
+		log.Println("<INFO> Shuffle server: Shutdown error / ", err)
+	} else {
+		log.Println("<INFO> Shuffle server: Shutdown Successfully")
+	}
+}
+
+func (ss *ShuffleServer) FetchForShuffle(args FetchForShuffleArgs, reply *FetchForShuffleReply) error {
+
+	data, updatedOffset, isDone, err := ss.readBytesByOffset(args.Filename, args.Offset, args.Size)
+
+	if err != nil {
+		return fmt.Errorf("RPC call: ShuffleService.FetchForShuffle: %v", err)
+	}
+
+	reply.Data = data
+	reply.EOF = isDone
+	reply.Offset = updatedOffset
+
+	return nil
+}
+
+func (ss *ShuffleServer) readBytesByOffset(filename string, offset int64, size int) ([]byte, int64, bool, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, offset, false, fmt.Errorf("failed open %v", filename)
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, offset, false, fmt.Errorf("failed get stat from %v", filename)
+	}
+
+	isDone := false
+
+	chunksize := int64(size)
+
+	remaining := fileInfo.Size() - offset
+
+	if remaining < int64(size) {
+		chunksize = remaining
+		isDone = true
+	}
+
+	buf := make([]byte, int(chunksize))
+
+	_, err = file.Seek(offset, io.SeekStart)
+
+	if err != nil {
+		return nil, offset, false, fmt.Errorf("failed seek offset %v on %v", offset, filename)
+	}
+
+	n, err := io.ReadFull(file, buf)
+	if err != nil {
+		if err == io.EOF {
+			println("<CHECKPOINT #1>")
+			isDone = true
+		} else {
+			return nil, offset, false, fmt.Errorf("failed to read from offset %v on %v", offset, filename)
+		}
+	}
+
+	updatedOffset := offset + int64(n)
+
+	return buf, updatedOffset, isDone, nil
 }
 
 // ------------------------
@@ -913,6 +1220,7 @@ func MakeWorker(mapf mapFunc, reducef reduceFunc) {
 	log.SetPrefix(prefix)
 
 	w := Worker{
+
 		mapf:    mapf,
 		reducef: reducef,
 
@@ -925,7 +1233,7 @@ func MakeWorker(mapf mapFunc, reducef reduceFunc) {
 	w.signalHandler = &signalHandler{
 		w: &w,
 	}
-	w.shuffleServer = &shuffleServer{
+	w.shuffleServer = &ShuffleServer{
 		w: &w,
 	}
 

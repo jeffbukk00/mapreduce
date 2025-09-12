@@ -12,6 +12,7 @@ import (
 const (
 	CoordinatorService = "CoordinatorService"
 	SignalService      = "SignalService"
+	ShuffleService     = "ShuffleService"
 )
 
 const (
@@ -22,8 +23,11 @@ const (
 )
 
 const (
-	// An example of signal service method name.
 	SignalPing = "SignalService.Ping"
+)
+
+const (
+	ShuffleFetch = "ShuffleService.FetchForShuffle"
 )
 
 // ------------------------
@@ -31,7 +35,8 @@ const (
 // ------------------------
 
 // ConnectArgs is an argument type of RPC method "CoordinatorService.Connect"
-type ConnectArgs struct{}
+type ConnectArgs struct {
+}
 
 // ConnectReply is a return type of RPC method "CoordinatorService.Connect"
 type ConnectReply struct {
@@ -57,14 +62,14 @@ type FetchInputPathArgs struct {
 
 // FetchInputPathReply is a return type of RPC method "CoordinatorService.FetchInputPath"
 type FetchInputPathReply struct {
-	InputPaths []Input
+	InputPaths []Path
 }
 
 // CommitOutputArgs is an argument type of RPC method "CoordinatorService.CommitOutput"
 type CommitOutputArgs struct {
 	Profile    WorkerProfile
 	Task       AssignedTask
-	OutputPath []string
+	OutputPath []Path
 }
 
 // CommitOutputReply is a return type of RPC method "CoordinatorService.CommitOutput"
@@ -84,8 +89,34 @@ type PingReply struct {
 	Resp PingResponse
 }
 
+// ------------------------
+// Args and reply type definitions for shuffling
+// ------------------------
+
+// FetchForShuffleArgs is an argument type of RPC method "ShuffleService.FetchForShuffle"
+type FetchForShuffleArgs struct {
+	Filename string
+	Offset   int64
+	Size     int
+}
+
+// FetchForShuffleReply is a return type of RPC method "ShuffleService.FetchForShuffle"
+type FetchForShuffleReply struct {
+	Data   []byte
+	Offset int64
+	EOF    bool
+}
+
 func CoordinatorSock() string {
-	s := "/var/tmp/5840-mr-"
+	s := "/var/tmp/mr-coord-"
 	s += strconv.Itoa(os.Getuid())
+	return s
+}
+
+func ShuffleServerSock() string {
+	s := "/var/tmp/mr-shuffle-"
+	s += strconv.Itoa(os.Getuid()) + "-"
+	s += strconv.Itoa(os.Getpid())
+
 	return s
 }
