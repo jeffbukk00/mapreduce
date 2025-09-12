@@ -11,6 +11,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -782,17 +783,7 @@ func (el *executionLoop) shuffle() {
 }
 
 func (el *executionLoop) processTask() {
-	w := el.w.getWorkerProfile().profile
-	t := el.w.getTask().task
-	addr := el.w.getAddr().addr
-
-	// Breakpoint:
-	if t.Class == Reduce {
-		log.Println("<BREAKPOINT>")
-		time.Sleep(5 * time.Second)
-	}
-
-	write := func(filename string, listKV []KeyValue) {
+	writeLocal := func(filename string, listKV []KeyValue) {
 		// Writes to local FS.
 		file, err := os.Create(filename)
 		if err != nil {
@@ -801,7 +792,8 @@ func (el *executionLoop) processTask() {
 		defer file.Close()
 
 		for _, v := range listKV {
-			_, err := fmt.Fprintf(file, "%v %v\n", v.Key, v.Value)
+
+			_, err = fmt.Fprintf(file, "%v %v\n", v.Key, v.Value)
 
 			if err != nil {
 				log.Fatalf("<FATAL> Non-recoverable error from local file write: %v: %v", filename, err)
@@ -810,7 +802,62 @@ func (el *executionLoop) processTask() {
 		}
 	}
 
+	writeAtomic := func(oldFilename string, newFilename string, listKV []KeyValue) {
+		// Writes to local FS.
+		file, err := os.Create(oldFilename)
+		if err != nil {
+			log.Fatalf("<FATAL> Non-recoverable error from local file create: %v: %v", oldFilename, err)
+		}
+
+		for _, v := range listKV {
+
+			_, err = fmt.Fprintf(file, "%v %v\n", v.Key, v.Value)
+
+			if err != nil {
+				file.Close()
+				os.Remove(oldFilename)
+				log.Fatalf("<FATAL> Non-recoverable error from local file write: %v: %v", oldFilename, err)
+			}
+
+		}
+
+		if err = file.Sync(); err != nil {
+			file.Close()
+			os.Remove(oldFilename)
+			log.Fatalf("<FATAL> Non-recoverable error from local file sync: %v: %v", oldFilename, err)
+		}
+
+		if err = file.Close(); err != nil {
+			os.Remove(oldFilename)
+			log.Fatalf("<FATAL> Non-recoverable error from local file close: %v: %v", oldFilename, err)
+		}
+
+		err = os.Rename(oldFilename, newFilename)
+		if err != nil {
+			// Recoverable error like EEXIST on window.
+			// Retry after remove the final path.
+			err = os.Remove(newFilename)
+			if err != nil {
+				log.Fatalf("<FATAL> Non-recoverable error from local file remove: %v: %v", newFilename, err)
+			} else {
+				err = os.Rename(oldFilename, newFilename)
+
+				if err != nil {
+					log.Fatalf("<FATAL> Non-recoverable error from local file rename from %v to %v: %v",
+						oldFilename, newFilename, err)
+				}
+
+			}
+		}
+
+	}
+
+	w := el.w.getWorkerProfile().profile
+	t := el.w.getTask().task
+	addr := el.w.getAddr().addr
+
 	setContextForMapTaskExec := func(mapFunc mapFunc) {
+
 		// Single input for a map task
 		inputFilename := el.inputFetcher.inputFetchState[0].Path.Filename
 		content := string(el.inputFetcher.fetchedInputs[0])
@@ -818,7 +865,7 @@ func (el *executionLoop) processTask() {
 		output := mapFunc(inputFilename, content)
 
 		getOutputFilename := func(partition int) string {
-			return fmt.Sprintf("output-worker-%v-map-%v-%v.txt", w.ID, t.Seq, partition)
+			return fmt.Sprintf("mr-out-worker-%v-map-%v-%v.txt", w.ID, t.Seq, partition)
 		}
 
 		numPartitions := t.NumOutputs
@@ -846,14 +893,60 @@ func (el *executionLoop) processTask() {
 				Filename: filename,
 			}
 
-			write(filename, v)
+			writeLocal(filename, v)
 		}
 	}
 
 	setContextForReduceTaskExec := func(reduceFunc reduceFunc) {
 		// Inputs(intermidiate KVs) for a reduce task must be ordered and grouped with the same key.
+		listKV := make([]KeyValue, 0)
+
+		for _, bytes := range el.inputFetcher.fetchedInputs {
+			s := string(bytes)
+			parts := strings.Split(s, "\n")
+			parts = parts[:len(parts)-1]
+			listKVPerInput := make([]KeyValue, len(parts))
+			for i, kvStr := range parts {
+
+				kvParts := strings.Split(kvStr, " ")
+
+				listKVPerInput[i] = KeyValue{
+					Key:   kvParts[0],
+					Value: kvParts[1],
+				}
+			}
+			listKV = append(listKV, listKVPerInput...)
+		}
+
+		sort.Sort(ByKey(listKV))
+
+		output := make([]KeyValue, 0)
+
+		for i := 0; i < len(listKV); {
+			key := listKV[i].Key
+			values := make([]string, 1)
+			values[0] = listKV[i].Value
+
+			j := i + 1
+			for ; j < len(listKV) && listKV[j].Key == key; j++ {
+				values = append(values, listKV[j].Value)
+			}
+
+			reducedValue := reduceFunc(key, values)
+
+			output = append(output, KeyValue{
+				Key:   key,
+				Value: reducedValue,
+			})
+
+			i = j
+		}
 
 		// Atomic rename
+		tempOutputFilename := fmt.Sprintf("mr-out-worker-%v-reduce-%v-tmp.txt", w.ID, t.Seq)
+		atomicFilename := fmt.Sprintf("mr-out-reduce-%v.txt", t.Seq)
+
+		writeAtomic(tempOutputFilename, atomicFilename, output)
 	}
 
 	if t.Class == Map {
@@ -862,7 +955,8 @@ func (el *executionLoop) processTask() {
 		setContextForReduceTaskExec(el.w.getReduceFunc().reduceFunc)
 	}
 
-	log.Println("<INFO> Execution loop: Task is fully-processed; All outputs are written")
+	log.Printf("<INFO> Execution loop: %v Task %v is fully-processed; All outputs are written\n", TaskClassToString(t.Class), t.Seq)
+
 	el.stageChan <- StageCommitOutput
 }
 

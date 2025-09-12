@@ -1,6 +1,7 @@
 src/main/pg-*.txt
 src/main/*.so
 src/main/test-mr*.sh
+src/main/mrsequential.go
 
 src/mrapps
 
